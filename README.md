@@ -41,14 +41,16 @@ The full design is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | Hosting | PostgreSQL 18 on **Neon**: pooled URL for the app, direct URL for migrations |
 | CI | GitHub Actions: gofmt, go vet, golangci-lint, sqlc drift check, `go test -race` with Postgres and Redis |
 | REST API | `POST /v1/events` (idempotent ingest with fan-out in one transaction) and `/v1/endpoints` CRUD. See [`docs/API.md`](docs/API.md). |
-| Security | Bearer API keys (hash lookup; revoked keys rejected); SSRF checks on endpoint URLs; signing secrets bound to their endpoint |
+| Security | Bearer API keys (hash lookup; revoked keys rejected); SSRF checks on endpoint URLs at registration *and* at connect time (DNS-rebinding safe); signing secrets bound to their endpoint |
+| Delivery worker | `hookrelay worker`: Asynq task handler that claims a delivery with a conditional update, signs it (Standard Webhooks HMAC-SHA256), POSTs the exact stored bytes, and records the attempt, fenced on `attempt_count`. Failures are rescheduled in PostgreSQL with exponential backoff and jitter, or marked `dead`. |
+| Mock receiver | `cmd/mockreceiver`: verifies signatures, logs `webhook-id`, and takes `?status=`, `?latency_ms=`, `?fail_rate=` |
 
-Not built yet: delivery workers, signing of outgoing requests, retries, and the dashboard. Ingested events
-currently wait as `pending` deliveries in PostgreSQL.
+Not built yet: the dispatcher and reaper (Phase 4) and the dashboard. Until the dispatcher exists, a
+pending delivery is handed to the worker by hand with `hookrelay admin enqueue-delivery`.
 
 ## Tech stack
 
-Go · Chi · pgx/v5 · sqlc · goose · Asynq + Redis (planned) · PostgreSQL 18 (Neon) ·
+Go · Chi · pgx/v5 · sqlc · goose · Asynq + Redis · PostgreSQL 18 (Neon) ·
 Next.js + Tailwind + shadcn/ui (planned) · Docker · GitHub Actions · k6 (planned)
 
 ## Getting started
@@ -98,6 +100,7 @@ make run-api                      # http://localhost:8080/healthz and /readyz
 ```
 backend/
   cmd/hookrelay/        CLI entrypoint: api | worker | migrate | admin
+  cmd/mockreceiver/     local webhook receiver for testing deliveries
   db/migrations/        goose SQL migrations (embedded into the binary)
   db/queries/           hand-written SQL for sqlc
   internal/config/      strict environment configuration
@@ -105,6 +108,9 @@ backend/
   internal/store/       pgx pool, transactions, sqlc-generated code (sqlcgen/)
   internal/migrate/     migration runner
   internal/secrets/     AES-GCM encryption, API keys, signing secrets
+  internal/delivery/    Asynq task + handler (claim, send, record), SSRF-guarded HTTP sender
+  internal/signing/     Standard Webhooks sign/verify
+  internal/backoff/     retry schedule (exponential, full jitter, Retry-After)
 docs/                   product spec, architecture, implementation plan
 neon.ts                 Neon project configuration (`neon deploy`)
 web/                    reserved for the Next.js dashboard
@@ -124,8 +130,8 @@ Unknown or malformed `HOOKRELAY_*` variables stop the process at startup. Requir
 | 0 | Scaffolding, config, logging, health checks, CI | ✅ Done |
 | 1 | Schema, migrations, sqlc, secrets, admin CLI | ✅ Done (live on Neon) |
 | 2 | REST API: API-key auth, endpoint CRUD, event ingest with fan-out and idempotency | ✅ Done |
-| 3 | Delivery core: signing, SSRF-safe HTTP sender, worker claim/record | Next |
-| 4 | Dispatcher, retries with backoff, reaper, reliability tests | |
+| 3 | Delivery core: signing, SSRF-safe HTTP sender, worker claim/record, retry scheduling | ✅ Done |
+| 4 | Dispatcher, reaper, end-to-end reliability tests | Next |
 | 5 | Read APIs, manual retry, stats | |
 | 6 | Next.js dashboard | |
 | 7 | k6 load tests and published benchmarks | |

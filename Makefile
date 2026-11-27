@@ -62,8 +62,12 @@ run-api: ## Run the API server (uses .env)
 	cd $(BACKEND_DIR) && go run ./cmd/hookrelay api
 
 .PHONY: run-worker
-run-worker: ## Run the worker (placeholder until Phase 3)
+run-worker: ## Run the delivery worker (Asynq; needs Postgres and Redis)
 	cd $(BACKEND_DIR) && go run ./cmd/hookrelay worker
+
+.PHONY: run-mockreceiver
+run-mockreceiver: ## Run the mock webhook receiver on 127.0.0.1:9000 (set MOCKRECEIVER_SECRET to verify signatures)
+	cd $(BACKEND_DIR) && go run ./cmd/mockreceiver -addr 127.0.0.1:9000
 
 .PHONY: fmt
 fmt: ## Format Go code

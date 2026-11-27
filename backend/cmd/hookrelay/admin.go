@@ -9,8 +9,10 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/jeevss131436/Hookrelay/backend/internal/delivery"
 	"github.com/jeevss131436/Hookrelay/backend/internal/secrets"
 	"github.com/jeevss131436/Hookrelay/backend/internal/store"
 	"github.com/jeevss131436/Hookrelay/backend/internal/store/sqlcgen"
@@ -23,6 +25,9 @@ Commands:
       Create a project and its first API key (one transaction).
   create-key --project PROJECT_ID [--name NAME]
       Create an additional API key for an existing project.
+  enqueue-delivery --project PROJECT_ID --delivery DELIVERY_ID
+      Hand one pending/scheduled delivery to the worker queue now (testing
+      and operations; the Phase 4 dispatcher does this automatically).
 
 The plaintext API key is printed once, to stdout. Only its SHA-256 hash is stored.
 `
@@ -92,9 +97,44 @@ func runAdmin(ctx context.Context, e *cmdEnv) error {
 			return nil
 		})
 
+	case "enqueue-delivery":
+		projectFlag := fs.String("project", "", "project ID")
+		deliveryFlag := fs.String("delivery", "", "delivery ID")
+		if err := parseFlags(fs, rest); err != nil {
+			return err
+		}
+		projectID, err := store.ParseUUID(*projectFlag)
+		if err != nil {
+			return newUsageError(adminUsage, "--project: %v", err)
+		}
+		deliveryID, err := store.ParseUUID(*deliveryFlag)
+		if err != nil {
+			return newUsageError(adminUsage, "--delivery: %v", err)
+		}
+		return withStore(ctx, e, func(st *store.Store) error {
+			return enqueueDelivery(ctx, e, st, projectID, deliveryID)
+		})
+
 	default:
 		return newUsageError(adminUsage, "unknown admin command %q", sub)
 	}
+}
+
+func enqueueDelivery(ctx context.Context, e *cmdEnv, st *store.Store, projectID, deliveryID pgtype.UUID) error {
+	rdb, err := newRedisClient(ctx, e.cfg.RedisURL)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rdb.Close() }()
+	client := asynq.NewClientFromRedisClient(rdb)
+	p, err := delivery.EnqueueOne(ctx, st, client, projectID, deliveryID, e.cfg.TaskTimeout)
+	if err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(e.stdout, "Enqueued delivery %s (task %s)\n", deliveryID.String(), p.TaskID())
+	e.log.Info("delivery enqueued", "delivery_id", deliveryID.String(), "project_id", projectID.String(),
+		"task_id", p.TaskID())
+	return nil
 }
 
 func parseFlags(fs *flag.FlagSet, args []string) error {

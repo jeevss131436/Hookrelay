@@ -162,9 +162,15 @@ At step 6 on a failure (non-2xx, timeout or network error):
 - Otherwise set `status='dead'` and `completed_at = now()`.
 
 Backoff uses exponential growth with full jitter:
-`delay = random(0, min(cap, base * 2^(n-1)))`, with a floor of `base/2`. Here `base = 30s` and `cap = 6h`.
+`delay = random(0, min(cap, base * 2^(n-1)))`, with a floor of `base/2`. Here `base = 5m` and `cap = 6h`.
 With 10 attempts the total span is roughly 12–24 hours. If the response is `429` or `503`
 and includes a `Retry-After` header, the delay is `max(computed, Retry-After)`, capped at `cap`.
+
+> **Changed in Phase 3: `base` is 5 minutes, not 30 seconds.** The original `base = 30s` contradicted
+> the window stated here and in PRODUCT_SPEC §4.3 ("up to 10 attempts over roughly 24 hours"): with
+> 30 s the nine delays' ceilings sum to only ~4.3 h. With 5 m the ceilings are 5, 10, 20, 40, 80, 160,
+> 320 min, then 6 h, 6 h: ~22.6 h worst case and ~11.5 h expected. The product-level window was kept,
+> and the constant changed. `internal/backoff` has a test that pins this.
 
 ### 3.3 Delivery state machine
 
@@ -202,6 +208,50 @@ Every transition is a conditional `UPDATE ... WHERE status = <expected>`. No tra
 | Worker crashes mid-HTTP | The row is `in_flight` and its lock expires. | The reaper moves it to `scheduled`. The attempt counts as consumed, and the receiver may get a duplicate (at-least-once). |
 | Postgres down | Ingest returns 503. The dispatcher and workers error out. Asynq tasks fail with MaxRetry 0. | The rows still hold the correct state, and the reaper and dispatcher resume once the DB is back. |
 | Receiver slow or hanging | The 10 s client timeout fires. | The attempt is recorded as `timeout` and retried later. |
+
+### 3.5 Delivery worker (implemented in Phase 3)
+
+```
+Asynq task "delivery:deliver" {project_id, delivery_id, attempt_count}
+  │  TaskID "{delivery_id}:{attempt_count}", MaxRetry(0), Timeout(HOOKRELAY_TASK_TIMEOUT)
+  ▼
+claim tx ── CancelQueuedDeliveryForInactiveEndpoint (endpoint disabled/deleted → cancelled, nothing sent)
+        └─ ClaimDelivery: queued → in_flight, attempt_count+1, locked_until = now()+lease
+           WHERE project_id AND id AND status='queued' AND attempt_count = task's count
+           (no row → duplicate/stale/foreign task: ack, nothing sent)
+        └─ GetDeliveryTarget: stored payload bytes, endpoint URL, secret ciphertext
+  ▼  (no transaction open)
+decrypt secret (AAD = project+endpoint) → sign (Standard Webhooks) → POST via SSRF-guarded client
+  ▼
+record tx ── InsertDeliveryAttempt (ON CONFLICT DO NOTHING: history is kept even if fenced out)
+          └─ 2xx:  MarkDeliverySucceeded   } both WHERE status='in_flight' AND attempt_count = n;
+          └─ else: MarkDeliveryFailed      } zero rows = fenced out (a newer attempt owns the row)
+                   → 'dead' if permanent or attempt_count >= max_attempts, else 'scheduled'
+                     with next_attempt_at = now() + backoff delay (DB clock)
+```
+
+Implementation decisions:
+- **The claim is also fenced on `attempt_count`.** The task carries the count it was enqueued with, so each enqueue
+  authorizes at most one attempt. Tasks for another project match nothing, because every query is scoped by `project_id`.
+- **Permanent failures go straight to `dead`:** a destination blocked by the SSRF policy (including after DNS
+  rebinding) and an unparseable stored URL. Every HTTP status other than 2xx, plus timeouts and DNS, TLS and
+  connection errors, is retried, as PRODUCT_SPEC §4.3 requires. 3xx responses are not followed and count as `http_status` failures.
+- **Internal errors (database unreachable, secret undecryptable) are not recorded as attempts.** The handler returns an
+  error and Asynq archives the task without retrying. If the claim had committed, the row stays `in_flight` until its lease
+  expires, and the Phase 4 reaper then recovers it.
+- **The record transaction is detached from the task context** (its own 10 s timeout), so an attempt that already happened
+  is recorded even during shutdown or after the task deadline.
+- **Attempt timestamps:** `started_at` comes from the Go clock and `finished_at = started_at + monotonic duration`, so the
+  `finished_at >= started_at` CHECK holds. Scheduling comparisons still use only `now()` (D8).
+- **Response bodies** keep the first 4096 bytes and are sanitized to valid UTF-8 with no NUL bytes, because the column
+  is `text`. Up to 64 KB more is drained so the connection can be reused. Error messages drop the URL and are capped at 1 KB.
+- **SSRF at delivery time:** the dialer resolves the host itself and rejects the whole answer if any address is
+  disallowed. `net.Dialer.Control` then re-checks the literal IP:port the socket connects to. Proxies are disabled
+  (a proxy would make the proxy the connected address), and redirects are not followed. One shared `http.Client` is used.
+- **Worker startup** pings Postgres and Redis (verifying Redis credentials) and fails fast. Asynq's `ShutdownTimeout`
+  is `HOOKRELAY_SHUTDOWN_TIMEOUT`, and concurrency is `HOOKRELAY_WORKER_CONCURRENCY` (default 50).
+- **No dispatcher yet:** `hookrelay admin enqueue-delivery` hands one pending or scheduled delivery to the queue (mark
+  `queued`, commit, then enqueue). It is for manual testing and operations. Phase 4 adds the dispatcher and reaper.
 
 ---
 
