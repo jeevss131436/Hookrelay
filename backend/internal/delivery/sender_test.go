@@ -307,7 +307,8 @@ func TestSendClassifiesTransportErrors(t *testing.T) {
 }
 
 func TestTaskPayloadRoundTrip(t *testing.T) {
-	p := Payload{ProjectID: store.NewUUID(), DeliveryID: store.NewUUID(), AttemptCount: 3}
+	queuedAt := time.Date(2026, 1, 2, 3, 4, 5, 123456000, time.UTC)
+	p := Payload{ProjectID: store.NewUUID(), DeliveryID: store.NewUUID(), AttemptCount: 3, QueuedAt: queuedAt}
 	task, err := NewTask(p, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -316,10 +317,11 @@ func TestTaskPayloadRoundTrip(t *testing.T) {
 		t.Errorf("type = %q", task.Type())
 	}
 	got, err := ParsePayload(task.Payload())
-	if err != nil || got != p {
+	if err != nil || got.ProjectID != p.ProjectID || got.DeliveryID != p.DeliveryID ||
+		got.AttemptCount != p.AttemptCount || !got.QueuedAt.Equal(p.QueuedAt) {
 		t.Fatalf("ParsePayload = %+v, %v; want %+v", got, err, p)
 	}
-	if want := p.DeliveryID.String() + ":3"; p.TaskID() != want {
+	if want := p.DeliveryID.String() + ":3:" + strconv.FormatInt(queuedAt.UnixMicro(), 10); p.TaskID() != want {
 		t.Errorf("TaskID = %q, want %q", p.TaskID(), want)
 	}
 	for _, bad := range []string{`not json`, `{}`, `{"project_id":"` + p.ProjectID.String() + `"}`} {
@@ -327,8 +329,18 @@ func TestTaskPayloadRoundTrip(t *testing.T) {
 			t.Errorf("ParsePayload(%s) succeeded", bad)
 		}
 	}
-	if _, err := NewTask(Payload{ProjectID: p.ProjectID, DeliveryID: pgtype.UUID{}}, time.Second); err == nil {
+	if _, err := NewTask(Payload{ProjectID: p.ProjectID, DeliveryID: pgtype.UUID{}, QueuedAt: queuedAt}, time.Second); err == nil {
 		t.Error("NewTask accepted a payload without delivery_id")
+	}
+	if _, err := NewTask(Payload{ProjectID: p.ProjectID, DeliveryID: p.DeliveryID}, time.Second); err == nil {
+		t.Error("NewTask accepted a payload without queued_at")
+	}
+	// A new dispatch of the same attempt gets a new task ID (archived tasks
+	// keep their IDs in Asynq, so a fixed ID could block re-dispatch).
+	again := p
+	again.QueuedAt = queuedAt.Add(time.Millisecond)
+	if again.TaskID() == p.TaskID() {
+		t.Error("task ID does not change between dispatches")
 	}
 }
 

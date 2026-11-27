@@ -20,11 +20,13 @@ import (
 const usage = `Usage: hookrelay <command> [args]
 
 Commands:
-  api       Run the HTTP API server
-  worker    Run the delivery worker (dispatcher, reaper, Asynq handlers)
-  migrate   Manage database migrations (up, down, status, version)
-  admin     Administrative tasks (create-project, create-key)
-  help      Show this help
+  api         Run the HTTP API server
+  worker      Run the delivery worker: Asynq handlers + dispatcher + reaper
+  dispatcher  Run only the dispatcher loop (Postgres -> Redis)
+  reaper      Run only the reaper loop (recovers stuck deliveries)
+  migrate     Manage database migrations (up, down, status, version)
+  admin       Administrative tasks (create-project, create-key, enqueue-delivery)
+  help        Show this help
 
 Configuration is read from environment variables; see .env.example.
 `
@@ -78,6 +80,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		cmd = command{run: runAPI}
 	case "worker":
 		cmd = command{run: runWorker}
+	case "dispatcher":
+		cmd = command{run: runDispatcher}
+	case "reaper":
+		cmd = command{run: runReaper}
 	case "migrate":
 		cmd = command{run: runMigrate, oneShot: true}
 	case "admin":

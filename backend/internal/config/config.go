@@ -66,6 +66,21 @@ type Config struct {
 	// at once (Asynq Concurrency). Delivery is I/O-bound, so it can be well
 	// above the CPU count (ARCHITECTURE §6.1).
 	WorkerConcurrency int
+
+	// Dispatcher: every DispatchInterval, move up to DispatchBatchSize due
+	// deliveries from Postgres into Redis (ARCHITECTURE §3.6).
+	DispatchInterval  time.Duration
+	DispatchBatchSize int
+	// DispatchLease is how long a delivery may sit in 'queued' without being
+	// claimed by a worker before the reaper re-dispatches it (its task was
+	// never enqueued, or Redis lost it). Too short re-dispatches deliveries
+	// that are merely waiting in a long queue (harmless but wasteful).
+	DispatchLease time.Duration
+
+	// Reaper: every ReaperInterval, recover up to ReaperBatchSize stale
+	// queued and expired in-flight deliveries (each).
+	ReaperInterval  time.Duration
+	ReaperBatchSize int
 }
 
 // knownVars lists every HOOKRELAY_* variable the application reads. Any other
@@ -82,6 +97,11 @@ var knownVars = map[string]bool{
 	"HOOKRELAY_ENCRYPTION_KEY":        true,
 	"HOOKRELAY_ALLOW_PRIVATE_TARGETS": true,
 	"HOOKRELAY_WORKER_CONCURRENCY":    true,
+	"HOOKRELAY_DISPATCH_INTERVAL":     true,
+	"HOOKRELAY_DISPATCH_BATCH_SIZE":   true,
+	"HOOKRELAY_DISPATCH_LEASE":        true,
+	"HOOKRELAY_REAPER_INTERVAL":       true,
+	"HOOKRELAY_REAPER_BATCH_SIZE":     true,
 }
 
 // Load builds a Config from the given environment. lookup behaves like
@@ -107,6 +127,11 @@ func Load(lookup func(string) (string, bool), environ []string) (*Config, error)
 		TaskTimeout:         l.duration("HOOKRELAY_TASK_TIMEOUT", 30*time.Second),
 		DeliveryLease:       l.duration("HOOKRELAY_DELIVERY_LEASE", 60*time.Second),
 		WorkerConcurrency:   l.intRange("HOOKRELAY_WORKER_CONCURRENCY", 50, 1, 1000),
+		DispatchInterval:    l.duration("HOOKRELAY_DISPATCH_INTERVAL", 500*time.Millisecond),
+		DispatchBatchSize:   l.intRange("HOOKRELAY_DISPATCH_BATCH_SIZE", 500, 1, 10000),
+		DispatchLease:       l.duration("HOOKRELAY_DISPATCH_LEASE", 5*time.Minute),
+		ReaperInterval:      l.duration("HOOKRELAY_REAPER_INTERVAL", 30*time.Second),
+		ReaperBatchSize:     l.intRange("HOOKRELAY_REAPER_BATCH_SIZE", 500, 1, 10000),
 	}
 
 	switch cfg.Env {
@@ -164,6 +189,16 @@ func Load(lookup func(string) (string, bool), environ []string) (*Config, error)
 	if cfg.TaskTimeout > 0 && cfg.DeliveryLease > 0 && cfg.DeliveryLease <= cfg.TaskTimeout {
 		l.errf("HOOKRELAY_DELIVERY_LEASE (%s) must be greater than HOOKRELAY_TASK_TIMEOUT (%s)",
 			cfg.DeliveryLease, cfg.TaskTimeout)
+	}
+
+	// A queued delivery normally waits only for a free worker. A lease shorter
+	// than that wait would make the reaper re-dispatch healthy deliveries in a
+	// loop, so require a generous floor.
+	if cfg.DispatchLease > 0 && cfg.DispatchLease < 30*time.Second {
+		l.errf("HOOKRELAY_DISPATCH_LEASE (%s) must be at least 30s", cfg.DispatchLease)
+	}
+	if cfg.DispatchInterval > 0 && cfg.DispatchInterval > time.Minute {
+		l.errf("HOOKRELAY_DISPATCH_INTERVAL (%s) must be at most 1m (it bounds dispatch latency)", cfg.DispatchInterval)
 	}
 
 	if len(l.errs) > 0 {

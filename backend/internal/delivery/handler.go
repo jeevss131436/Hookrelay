@@ -22,8 +22,9 @@ type Outcome string
 
 // Outcomes.
 const (
-	// OutcomeSkipped: the claim matched no row (duplicate or stale task,
-	// delivery already handled, or a task for another project). Nothing sent.
+	// OutcomeSkipped: the claim matched no row (duplicate or stale task, task
+	// from an earlier dispatch, delivery already handled, or a task for another
+	// project). Nothing sent.
 	OutcomeSkipped Outcome = "skipped"
 	// OutcomeCancelled: the endpoint was disabled or deleted after dispatch.
 	OutcomeCancelled Outcome = "cancelled"
@@ -118,7 +119,7 @@ func (h *Handler) Deliver(ctx context.Context, p Payload) (Outcome, error) {
 	if err != nil {
 		// Not the receiver's fault and not fixable by another attempt now
 		// (wrong HOOKRELAY_ENCRYPTION_KEY?). The row stays in_flight and the
-		// reaper (Phase 4) recovers it once the lease expires.
+		// reaper recovers it once the lease expires.
 		log.ErrorContext(ctx, "cannot decrypt endpoint signing secret", slog.String("error", err.Error()))
 		return "", err
 	}
@@ -168,7 +169,7 @@ func (h *Handler) claim(ctx context.Context, p Payload) (claimed, error) {
 	err := h.store.InTx(ctx, func(q *sqlcgen.Queries) error {
 		c = claimed{}
 		n, err := q.CancelQueuedDeliveryForInactiveEndpoint(ctx, sqlcgen.CancelQueuedDeliveryForInactiveEndpointParams{
-			ProjectID: p.ProjectID, ID: p.DeliveryID, ExpectedAttemptCount: p.AttemptCount,
+			ProjectID: p.ProjectID, ID: p.DeliveryID, ExpectedAttemptCount: p.AttemptCount, QueuedAt: p.QueuedAt,
 		})
 		if err != nil {
 			return fmt.Errorf("cancel for inactive endpoint: %w", err)
@@ -179,7 +180,7 @@ func (h *Handler) claim(ctx context.Context, p Payload) (claimed, error) {
 		}
 		row, err := q.ClaimDelivery(ctx, sqlcgen.ClaimDeliveryParams{
 			LeaseMs: h.lease.Milliseconds(), ProjectID: p.ProjectID, ID: p.DeliveryID,
-			ExpectedAttemptCount: p.AttemptCount,
+			ExpectedAttemptCount: p.AttemptCount, QueuedAt: p.QueuedAt,
 		})
 		if store.IsNotFound(err) {
 			c.outcome = OutcomeSkipped

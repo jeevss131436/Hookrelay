@@ -21,6 +21,7 @@ WHERE d.project_id = $1
   AND d.id = $2
   AND d.status = 'queued'
   AND d.attempt_count = $3
+  AND d.queued_at = $4::timestamptz
   AND e.project_id = d.project_id
   AND e.id = d.endpoint_id
   AND (NOT e.enabled OR e.deleted_at IS NOT NULL)
@@ -30,12 +31,18 @@ type CancelQueuedDeliveryForInactiveEndpointParams struct {
 	ProjectID            pgtype.UUID
 	ID                   pgtype.UUID
 	ExpectedAttemptCount int32
+	QueuedAt             time.Time
 }
 
 // A queued delivery whose endpoint was disabled or deleted after dispatch is
 // cancelled instead of sent. Runs in the claim transaction, before the claim.
 func (q *Queries) CancelQueuedDeliveryForInactiveEndpoint(ctx context.Context, arg CancelQueuedDeliveryForInactiveEndpointParams) (int64, error) {
-	result, err := q.db.Exec(ctx, cancelQueuedDeliveryForInactiveEndpoint, arg.ProjectID, arg.ID, arg.ExpectedAttemptCount)
+	result, err := q.db.Exec(ctx, cancelQueuedDeliveryForInactiveEndpoint,
+		arg.ProjectID,
+		arg.ID,
+		arg.ExpectedAttemptCount,
+		arg.QueuedAt,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -51,6 +58,7 @@ WHERE project_id = $2
   AND id = $3
   AND status = 'queued'
   AND attempt_count = $4
+  AND queued_at = $5::timestamptz
 RETURNING attempt_count, max_attempts, event_id, endpoint_id
 `
 
@@ -59,6 +67,7 @@ type ClaimDeliveryParams struct {
 	ProjectID            pgtype.UUID
 	ID                   pgtype.UUID
 	ExpectedAttemptCount int32
+	QueuedAt             time.Time
 }
 
 type ClaimDeliveryRow struct {
@@ -69,15 +78,17 @@ type ClaimDeliveryRow struct {
 }
 
 // The claim (D3): only the worker whose UPDATE matches 'queued' with the
-// attempt_count the task was enqueued with may send. Duplicate or stale tasks
-// match no row. The lease bounds how long the claim is honoured before the
-// reaper (Phase 4) may hand the delivery to another worker.
+// attempt_count AND queued_at of the dispatch that produced its task may send.
+// Each dispatch therefore authorizes exactly one claim; duplicate or stale
+// tasks (from an earlier dispatch of the same attempt) match no row. The lease
+// bounds how long the claim is honoured before the reaper may recover it.
 func (q *Queries) ClaimDelivery(ctx context.Context, arg ClaimDeliveryParams) (ClaimDeliveryRow, error) {
 	row := q.db.QueryRow(ctx, claimDelivery,
 		arg.LeaseMs,
 		arg.ProjectID,
 		arg.ID,
 		arg.ExpectedAttemptCount,
+		arg.QueuedAt,
 	)
 	var i ClaimDeliveryRow
 	err := row.Scan(
@@ -87,6 +98,70 @@ func (q *Queries) ClaimDelivery(ctx context.Context, arg ClaimDeliveryParams) (C
 		&i.EndpointID,
 	)
 	return i, err
+}
+
+const claimDueDeliveriesForDispatch = `-- name: ClaimDueDeliveriesForDispatch :many
+
+WITH due AS (
+  SELECT id
+  FROM deliveries
+  WHERE status IN ('pending', 'scheduled')
+    AND next_attempt_at <= now()
+  ORDER BY next_attempt_at
+  LIMIT $1
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE deliveries d
+SET status    = 'queued',
+    queued_at = now()
+FROM due
+WHERE d.id = due.id
+  AND d.status IN ('pending', 'scheduled')
+RETURNING d.project_id, d.id, d.attempt_count, d.queued_at::timestamptz AS queued_at
+`
+
+type ClaimDueDeliveriesForDispatchRow struct {
+	ProjectID    pgtype.UUID
+	ID           pgtype.UUID
+	AttemptCount int32
+	QueuedAt     time.Time
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher and reaper (docs/ARCHITECTURE.md section 3.6).
+//
+// These are system-wide maintenance queries and are deliberately NOT scoped by
+// project_id: they move rows between internal states and never return tenant
+// data to a caller. Every write is still conditional on the expected status.
+// ---------------------------------------------------------------------------
+// Dispatcher step 1 (its own short transaction): move up to batch_size due
+// deliveries to 'queued'. SKIP LOCKED lets several dispatchers run at once
+// without picking the same rows. All rows of one batch share queued_at (now()
+// is the transaction start time). The caller enqueues the tasks only AFTER
+// this commits: Redis is never touched inside a transaction.
+func (q *Queries) ClaimDueDeliveriesForDispatch(ctx context.Context, batchSize int32) ([]ClaimDueDeliveriesForDispatchRow, error) {
+	rows, err := q.db.Query(ctx, claimDueDeliveriesForDispatch, batchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClaimDueDeliveriesForDispatchRow{}
+	for rows.Next() {
+		var i ClaimDueDeliveriesForDispatchRow
+		if err := rows.Scan(
+			&i.ProjectID,
+			&i.ID,
+			&i.AttemptCount,
+			&i.QueuedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getDelivery = `-- name: GetDelivery :one
@@ -203,6 +278,48 @@ func (q *Queries) InsertDeliveryAttempt(ctx context.Context, arg InsertDeliveryA
 	return result.RowsAffected(), nil
 }
 
+const insertWorkerLostAttempt = `-- name: InsertWorkerLostAttempt :execrows
+INSERT INTO delivery_attempts (
+  project_id, delivery_id, attempt_number, started_at, finished_at, duration_ms,
+  error_kind, error_message
+)
+SELECT d.project_id, d.id, d.attempt_count, d.updated_at, greatest(now(), d.updated_at),
+       least(greatest(extract(epoch FROM now() - d.updated_at) * 1000, 0), 2147483647)::integer,
+       'worker_lost', $1
+FROM deliveries d
+WHERE d.project_id = $2
+  AND d.id = $3
+  AND d.status = 'in_flight'
+  AND d.attempt_count = $4
+  AND d.locked_until < now()
+ON CONFLICT ON CONSTRAINT delivery_attempts_delivery_attempt_key DO NOTHING
+`
+
+type InsertWorkerLostAttemptParams struct {
+	ErrorMessage *string
+	ProjectID    pgtype.UUID
+	ID           pgtype.UUID
+	AttemptCount int32
+}
+
+// Reaper B, first statement of the recovery tx: record the abandoned attempt
+// as 'worker_lost'. started_at is the claim time (updated_at is set by the
+// claim and unchanged while in flight). Inserts nothing unless the row is
+// still in flight on that attempt with an expired lease, or if the attempt
+// was already recorded (by the worker, or by another reaper).
+func (q *Queries) InsertWorkerLostAttempt(ctx context.Context, arg InsertWorkerLostAttemptParams) (int64, error) {
+	result, err := q.db.Exec(ctx, insertWorkerLostAttempt,
+		arg.ErrorMessage,
+		arg.ProjectID,
+		arg.ID,
+		arg.AttemptCount,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const listDeliveryAttempts = `-- name: ListDeliveryAttempts :many
 SELECT id, project_id, delivery_id, attempt_number, started_at, finished_at, duration_ms, response_status, response_body, error_kind, error_message FROM delivery_attempts
 WHERE project_id = $1
@@ -237,6 +354,43 @@ func (q *Queries) ListDeliveryAttempts(ctx context.Context, arg ListDeliveryAtte
 			&i.ErrorKind,
 			&i.ErrorMessage,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listExpiredInFlightDeliveries = `-- name: ListExpiredInFlightDeliveries :many
+SELECT project_id, id, attempt_count
+FROM deliveries
+WHERE status = 'in_flight'
+  AND locked_until < now()
+ORDER BY locked_until
+LIMIT $1
+`
+
+type ListExpiredInFlightDeliveriesRow struct {
+	ProjectID    pgtype.UUID
+	ID           pgtype.UUID
+	AttemptCount int32
+}
+
+// Reaper B candidates: in-flight rows whose lease has expired. Read without
+// locks; each is then recovered in its own fenced transaction.
+func (q *Queries) ListExpiredInFlightDeliveries(ctx context.Context, batchSize int32) ([]ListExpiredInFlightDeliveriesRow, error) {
+	rows, err := q.db.Query(ctx, listExpiredInFlightDeliveries, batchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListExpiredInFlightDeliveriesRow{}
+	for rows.Next() {
+		var i ListExpiredInFlightDeliveriesRow
+		if err := rows.Scan(&i.ProjectID, &i.ID, &i.AttemptCount); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -307,12 +461,17 @@ SET status    = 'queued',
 WHERE project_id = $1
   AND id = $2
   AND status IN ('pending', 'scheduled')
-RETURNING attempt_count
+RETURNING attempt_count, queued_at::timestamptz AS queued_at
 `
 
 type MarkDeliveryQueuedParams struct {
 	ProjectID pgtype.UUID
 	ID        pgtype.UUID
+}
+
+type MarkDeliveryQueuedRow struct {
+	AttemptCount int32
+	QueuedAt     time.Time
 }
 
 // Delivery state transitions (docs/ARCHITECTURE.md section 3, D3).
@@ -324,13 +483,15 @@ type MarkDeliveryQueuedParams struct {
 //
 // Durations are written "interval '1 millisecond' * @x::bigint": sqlc v1.31
 // mis-rewrites the operand order "@x::bigint * interval '...'".
-// Manual hand-off to the queue (admin enqueue-delivery). The Phase 4
-// dispatcher performs the same transition in batches.
-func (q *Queries) MarkDeliveryQueued(ctx context.Context, arg MarkDeliveryQueuedParams) (int32, error) {
+// Manual hand-off to the queue (admin enqueue-delivery), regardless of
+// next_attempt_at. The dispatcher does the same for due rows in batches
+// (ClaimDueDeliveriesForDispatch). queued_at identifies this dispatch: it is
+// part of the task ID and fences the worker's claim.
+func (q *Queries) MarkDeliveryQueued(ctx context.Context, arg MarkDeliveryQueuedParams) (MarkDeliveryQueuedRow, error) {
 	row := q.db.QueryRow(ctx, markDeliveryQueued, arg.ProjectID, arg.ID)
-	var attempt_count int32
-	err := row.Scan(&attempt_count)
-	return attempt_count, err
+	var i MarkDeliveryQueuedRow
+	err := row.Scan(&i.AttemptCount, &i.QueuedAt)
+	return i, err
 }
 
 const markDeliverySucceeded = `-- name: MarkDeliverySucceeded :execrows
@@ -361,6 +522,70 @@ func (q *Queries) MarkDeliverySucceeded(ctx context.Context, arg MarkDeliverySuc
 		arg.ID,
 		arg.AttemptCount,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const releaseQueuedDeliveries = `-- name: ReleaseQueuedDeliveries :execrows
+UPDATE deliveries
+SET status          = 'scheduled',
+    next_attempt_at = now() + interval '1 millisecond' * $1::bigint
+WHERE id = ANY ($2::uuid[])
+  AND status = 'queued'
+  AND queued_at = $3::timestamptz
+`
+
+type ReleaseQueuedDeliveriesParams struct {
+	RetryDelayMs int64
+	Ids          []pgtype.UUID
+	QueuedAt     time.Time
+}
+
+// Dispatcher step 2 failed (Redis unavailable): give rows of this dispatch
+// back, to be retried after retry_delay_ms. Fenced on queued_at so a row that
+// was re-dispatched or claimed meanwhile is untouched.
+func (q *Queries) ReleaseQueuedDeliveries(ctx context.Context, arg ReleaseQueuedDeliveriesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseQueuedDeliveries, arg.RetryDelayMs, arg.Ids, arg.QueuedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const requeueStaleQueuedDeliveries = `-- name: RequeueStaleQueuedDeliveries :execrows
+WITH stale AS (
+  SELECT id
+  FROM deliveries
+  WHERE status = 'queued'
+    AND updated_at < now() - interval '1 millisecond' * $1::bigint
+  ORDER BY updated_at
+  LIMIT $2
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE deliveries d
+SET status          = 'scheduled',
+    next_attempt_at = now()
+FROM stale
+WHERE d.id = stale.id
+  AND d.status = 'queued'
+`
+
+type RequeueStaleQueuedDeliveriesParams struct {
+	StaleAfterMs int64
+	BatchSize    int32
+}
+
+// Reaper A: rows queued longer than the dispatch lease whose task never got
+// claimed (dispatcher crashed before enqueueing, release failed, or Redis lost
+// the task). They become due again immediately. No attempt was made, so
+// attempt_count is unchanged. A task that does still exist becomes stale:
+// the next dispatch gets a new queued_at, so the old task cannot claim.
+// (While queued, updated_at equals queued_at, which lets this use
+// deliveries_stuck_idx.)
+func (q *Queries) RequeueStaleQueuedDeliveries(ctx context.Context, arg RequeueStaleQueuedDeliveriesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, requeueStaleQueuedDeliveries, arg.StaleAfterMs, arg.BatchSize)
 	if err != nil {
 		return 0, err
 	}

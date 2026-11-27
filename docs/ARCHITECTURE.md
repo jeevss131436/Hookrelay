@@ -17,7 +17,8 @@ it stranded. This is the classic dual-write problem.
 **Decision.** Use a **transactional outbox**. The `deliveries` table itself serves as the
 outbox. Ingest writes the event and its delivery rows (`status = 'pending'`) in **one
 Postgres transaction**, and never touches Redis. A separate **dispatcher** loop reads
-due deliveries from Postgres and enqueues them into Asynq.
+due deliveries from Postgres and enqueues them into Asynq (§3.6: it commits the move to
+`queued` first and enqueues afterwards, so Redis is never called inside a transaction).
 
 **Consequence.** Redis can lose everything and nothing is permanently lost. A **reaper**
 finds deliveries that were handed to Redis but never completed, and makes them eligible
@@ -49,8 +50,9 @@ crash. Before doing any HTTP work, a worker **claims** the delivery atomically:
 ```sql
 UPDATE deliveries
 SET status = 'in_flight', attempt_count = attempt_count + 1,
-    locked_until = now() + interval '60 seconds', updated_at = now()
-WHERE id = $1 AND status = 'queued'
+    locked_until = now() + interval '60 seconds'
+WHERE project_id = $1 AND id = $2 AND status = 'queued'
+  AND attempt_count = $3 AND queued_at = $4   -- the values carried by the task (§3.6)
 RETURNING attempt_count, ...;
 ```
 
@@ -142,15 +144,10 @@ replicas.
    - `INSERT INTO events ... ON CONFLICT (project_id, idempotency_key) DO NOTHING`. If the insert conflicts, return the existing event (see §6.4).
    - `INSERT INTO deliveries (...) SELECT ... FROM endpoints WHERE project matches AND enabled AND deleted_at IS NULL AND (event_types = '{}' OR $type = ANY(event_types))`, with `status='pending'` and `next_attempt_at = now()`.
    - Commit, then return `202 {id, deliveries: n}`.
-3. **Dispatcher tick** (short tx):
-   ```sql
-   SELECT id, attempt_count FROM deliveries
-   WHERE status IN ('pending','scheduled') AND next_attempt_at <= now()
-   ORDER BY next_attempt_at LIMIT 500
-   FOR UPDATE SKIP LOCKED;
-   ```
-   For each row, enqueue the Asynq task `deliver` with `TaskID = "{delivery_id}:{attempt_count}"`,
-   `MaxRetry(0)` and `Timeout(30s)`. Then `UPDATE ... SET status='queued', queued_at=now()`. Commit.
+3. **Dispatcher tick** (see §3.6 for the full design and why it differs from the first sketch):
+   one statement moves up to 500 due rows to `queued` (`FOR UPDATE SKIP LOCKED`, `queued_at = now()`)
+   and commits. **Then**, outside any transaction, it enqueues one Asynq task per row with
+   `TaskID = "{delivery_id}:{attempt_count}:{queued_at}"`, `MaxRetry(0)` and `Timeout(30s)`.
 4. **Worker** picks up the task and claims it (D3), which sets `in_flight`, increments `attempt_count` and sets `locked_until`.
 5. The worker loads the event payload and endpoint, decrypts the secret, signs, and POSTs with a 10 s timeout through the SSRF-safe client.
 6. **Record tx:** insert a `delivery_attempts` row, then update the delivery to `succeeded` (fenced by status and attempt_count).
@@ -202,10 +199,12 @@ Every transition is a conditional `UPDATE ... WHERE status = <expected>`. No tra
 |---|---|---|
 | API crashes before commit | The client gets an error or a timeout. Nothing is persisted. | The client retries with the same `Idempotency-Key`. |
 | API crashes after commit, before responding | The event is persisted. The client sees an error. | The client retries with the same `Idempotency-Key` and gets the original event back. No duplicate is created. |
-| Redis down during dispatch | The enqueue fails and the dispatcher tx rolls back. Rows stay `pending`/`scheduled`. | They are dispatched on the next tick after Redis recovers. |
-| Enqueue succeeds but dispatcher commit fails | The task is in Redis while the row is still `pending`. | The worker's claim (`WHERE status='queued'`) finds nothing, so the task is dropped. The next tick re-enqueues it. A duplicate TaskID is treated as success. |
-| Redis data lost after a task was queued | The row stays `queued` forever. | The reaper moves `queued` rows older than 5 min to `scheduled`. |
-| Worker crashes mid-HTTP | The row is `in_flight` and its lock expires. | The reaper moves it to `scheduled`. The attempt counts as consumed, and the receiver may get a duplicate (at-least-once). |
+| Redis down during dispatch | The enqueue fails. The dispatcher releases the failed row and the rest of its batch back to `scheduled` (retry in 5 s) and backs off. | They are dispatched once Redis recovers. If the release also fails, the reaper re-dispatches them after the dispatch lease. |
+| Dispatcher crashes after marking rows `queued`, before enqueueing | Rows are `queued` with no task. | The reaper moves `queued` rows older than the dispatch lease (5 min) back to `scheduled`; they are re-dispatched. No attempt is consumed. |
+| Enqueue succeeded but the dispatcher saw an error (lost reply) | The row is released although its task exists. | The task is stale: the next dispatch has a new `queued_at`, so that task's claim matches nothing. |
+| Redis data lost after a task was queued | The row stays `queued` without a task. | Same as the dispatcher crash: the reaper re-dispatches it after the dispatch lease. |
+| Worker crashes mid-HTTP | The row is `in_flight` and its lock expires. | The reaper records a `worker_lost` attempt and applies the normal retry policy (`scheduled`, or `dead` on the last attempt). The attempt counts as consumed, and the receiver may get a duplicate (at-least-once). |
+| Worker hangs, is reaped, then finishes | Its record transaction is fenced out (`attempt_count` moved on, or the attempt row already exists). | Nothing to do: the reaper's outcome stands. |
 | Postgres down | Ingest returns 503. The dispatcher and workers error out. Asynq tasks fail with MaxRetry 0. | The rows still hold the correct state, and the reaper and dispatcher resume once the DB is back. |
 | Receiver slow or hanging | The 10 s client timeout fires. | The attempt is recorded as `timeout` and retried later. |
 
@@ -250,8 +249,64 @@ Implementation decisions:
   (a proxy would make the proxy the connected address), and redirects are not followed. One shared `http.Client` is used.
 - **Worker startup** pings Postgres and Redis (verifying Redis credentials) and fails fast. Asynq's `ShutdownTimeout`
   is `HOOKRELAY_SHUTDOWN_TIMEOUT`, and concurrency is `HOOKRELAY_WORKER_CONCURRENCY` (default 50).
-- **No dispatcher yet:** `hookrelay admin enqueue-delivery` hands one pending or scheduled delivery to the queue (mark
-  `queued`, commit, then enqueue). It is for manual testing and operations. Phase 4 adds the dispatcher and reaper.
+- **Manual hand-off:** `hookrelay admin enqueue-delivery` hands one pending or scheduled delivery to the queue (mark
+  `queued`, commit, then enqueue; release on failure), for testing and operations.
+- **Changed in Phase 4:** the claim is also fenced on `queued_at`, and the task ID includes it (see §3.6).
+
+### 3.6 Dispatcher and reaper (implemented in Phase 4)
+
+**Why not enqueue inside the dispatcher's transaction?** The first sketch (§3.1 before Phase 4) selected rows
+`FOR UPDATE SKIP LOCKED`, enqueued to Redis, then marked them `queued`, all in one transaction. That makes a
+network call to Redis while holding row locks (invariant 5), and a slow Redis would stall the transaction. Instead:
+
+```
+Dispatcher, every HOOKRELAY_DISPATCH_INTERVAL (500 ms; immediately again after a full batch):
+  1. one statement, own tx:  due pending/scheduled rows (SKIP LOCKED, LIMIT batch)
+                             → status='queued', queued_at=now()              COMMIT
+  2. no tx:                  for each row, enqueue task {project_id, delivery_id, attempt_count, queued_at}
+                             TaskID "{delivery_id}:{attempt_count}:{queued_at µs}", MaxRetry(0)
+                             ErrTaskIDConflict → already enqueued, success
+  3. on an enqueue error:    stop; release this row and the rest of the batch
+                             (queued → scheduled, next_attempt_at = now()+5s, fenced on queued_at);
+                             back off exponentially (to 30 s) and keep running
+
+Reaper, every HOOKRELAY_REAPER_INTERVAL (30 s):
+  A. queued rows untouched for HOOKRELAY_DISPATCH_LEASE (5 min) → scheduled, due now
+     (SKIP LOCKED batch; attempt_count unchanged: no attempt was made)
+  B. in_flight rows with locked_until < now(), each in its own tx:
+       INSERT attempt (attempt_count, 'worker_lost', started_at = claim time) ON CONFLICT DO NOTHING
+       MarkDeliveryFailed (the worker's own query): scheduled with backoff, or dead at max_attempts,
+       fenced on status='in_flight' AND attempt_count; if it matches nothing, ROLLBACK
+```
+
+**Crash and failure guarantees**
+- *No lost deliveries.* A committed delivery is always in a state some loop acts on: `pending`/`scheduled` (dispatcher),
+  `queued` (worker, or the reaper after the dispatch lease), `in_flight` (worker, or the reaper after the worker lease).
+  Every gap between Postgres and Redis ends in one of those states.
+- *Task IDs are unique per dispatch* (`queued_at` is part of them). Asynq keeps the IDs of archived tasks (a task that
+  timed out or whose handler failed), so an ID of only `{delivery_id}:{attempt_count}` would make every re-dispatch of that
+  attempt "conflict", be treated as already enqueued, and never run. With `queued_at` in the ID that cannot happen.
+- *One claim per dispatch.* The worker's claim requires the row's `attempt_count` **and** `queued_at` to match the task.
+  Tasks left over from an earlier dispatch (lost replies, reaper re-dispatch, duplicates) claim nothing.
+- *Duplicate enqueues are bounded:* a task is enqueued only right after a successful `→ queued` transition, and each
+  transition yields one task ID.
+- *Concurrent instances:* dispatchers use `SKIP LOCKED`; reaper A uses `SKIP LOCKED`; reaper B is fenced per row and the
+  attempt row is unique per `(delivery_id, attempt_number)`. Any number of `worker`, `dispatcher` and `reaper` processes
+  may run together.
+- *Reaper vs. a finishing worker:* both transactions insert the attempt row first and update the delivery second (the same
+  lock order), so they cannot deadlock. Whichever commits first wins; the other's fenced update matches nothing. If the
+  worker loses, the receiver may have got the request (at-least-once); its late result is not recorded.
+- *One retry system:* the reaper calls the same `MarkDeliveryFailed` query and the same `backoff.Policy` as the worker.
+- *Clock:* leases are compared on the database clock (`now()`). A database clock step forward larger than the lease would
+  make the reaper treat a live worker as lost. That only costs a duplicate send; fencing keeps the state correct.
+
+**Process roles** (D6 unchanged): `hookrelay worker` runs the Asynq handlers **and** the dispatcher and reaper loops, the
+simplest deployment. `hookrelay dispatcher` and `hookrelay reaper` run one loop each, for deployments that want to scale or
+isolate them. Mixing them is safe. On SIGTERM the loops stop first (a dispatch batch in progress finishes or releases its
+rows), then Asynq drains in-flight handlers.
+
+**Tenant scoping exception:** the dispatcher and reaper queries are system-wide maintenance queries and are not filtered by
+`project_id`. They never return tenant data to a caller; everything they write is conditional on the expected status.
 
 ---
 
@@ -397,7 +452,8 @@ are still running, which produces duplicate sends. This invariant must be checke
 
 ### 6.5 Graceful shutdown
 On SIGTERM: the API stops accepting requests and drains (`http.Server.Shutdown`). The
-worker stops the dispatcher and reaper loops, then `asynq.Server.Shutdown()` waits for
+worker stops the dispatcher and reaper loops (a dispatch batch in progress enqueues or
+releases its rows first), then `asynq.Server.Shutdown()` waits for
 in-flight handlers up to the timeout. Anything cut off is left `in_flight` and is
 recovered by the reaper after its lease expires. That is safe, just slower.
 
