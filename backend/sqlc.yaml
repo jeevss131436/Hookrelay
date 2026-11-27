@@ -1,0 +1,29 @@
+# sqlc reads the goose migrations as the schema (down sections are ignored)
+# and generates Go from db/queries/*.sql. Regenerate with `make sqlc`;
+# never edit internal/store/sqlcgen by hand.
+version: "2"
+sql:
+  - engine: postgresql
+    schema: db/migrations
+    queries: db/queries
+    strict_function_checks: true
+    gen:
+      go:
+        package: sqlcgen
+        out: internal/store/sqlcgen
+        sql_package: pgx/v5
+        emit_empty_slices: true
+        emit_enum_valid_method: true
+        emit_all_enum_values: true
+        emit_pointers_for_null_types: true
+        rename:
+          api_key: APIKey
+          url: URL
+        overrides:
+          - db_type: timestamptz
+            go_type: time.Time
+          - db_type: timestamptz
+            nullable: true
+            go_type:
+              type: time.Time
+              pointer: true
