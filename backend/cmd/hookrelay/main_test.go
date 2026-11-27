@@ -56,17 +56,21 @@ func setTestEnv(t *testing.T) {
 	t.Setenv("HOOKRELAY_ENCRYPTION_KEY", "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=") // test-only key
 }
 
-func TestWorkerFailsFastWithoutPostgres(t *testing.T) {
-	setTestEnv(t) // DATABASE_URL points at localhost:1, where nothing listens
-	var stdout, stderr bytes.Buffer
-	if code := run([]string{"worker"}, &stdout, &stderr); code != 1 {
-		t.Errorf("exit code = %d, want 1", code)
-	}
-	if !strings.Contains(stdout.String(), "connect to postgres") {
-		t.Errorf("stdout = %q", stdout.String())
-	}
-	if strings.Contains(stdout.String(), "u:p@") {
-		t.Errorf("log leaks the connection string: %q", stdout.String())
+func TestBackgroundRolesFailFastWithoutPostgres(t *testing.T) {
+	for _, role := range []string{"worker", "dispatcher", "reaper"} {
+		t.Run(role, func(t *testing.T) {
+			setTestEnv(t) // DATABASE_URL points at localhost:1, where nothing listens
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{role}, &stdout, &stderr); code != 1 {
+				t.Errorf("exit code = %d, want 1", code)
+			}
+			if !strings.Contains(stdout.String(), "connect to postgres") {
+				t.Errorf("stdout = %q", stdout.String())
+			}
+			if strings.Contains(stdout.String(), "u:p@") {
+				t.Errorf("log leaks the connection string: %q", stdout.String())
+			}
+		})
 	}
 }
 
@@ -79,6 +83,8 @@ func TestSubcommandUsageErrors(t *testing.T) {
 	}{
 		{"api extra args", []string{"api", "now"}, nil, "unexpected arguments"},
 		{"worker extra args", []string{"worker", "now"}, nil, "unexpected arguments"},
+		{"dispatcher extra args", []string{"dispatcher", "now"}, nil, "unexpected arguments"},
+		{"reaper extra args", []string{"reaper", "now"}, nil, "unexpected arguments"},
 		{"enqueue missing delivery", []string{"admin", "enqueue-delivery", "--project", "00000000-0000-4000-8000-000000000000"}, nil, "--delivery"},
 		{"enqueue bad project", []string{"admin", "enqueue-delivery", "--project", "x", "--delivery", "00000000-0000-4000-8000-000000000000"}, nil, "--project"},
 		{"migrate missing", []string{"migrate"}, nil, "missing migrate command"},

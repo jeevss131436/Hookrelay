@@ -99,11 +99,11 @@ func (e *env) pendingDeliveryWithPolicy(url string, policy ssrf.Policy) (deliver
 // queue does what the Phase 4 dispatcher will do: pending/scheduled -> queued.
 func (e *env) queue(id pgtype.UUID) Payload {
 	e.t.Helper()
-	n, err := e.st.MarkDeliveryQueued(e.ctx, sqlcgen.MarkDeliveryQueuedParams{ProjectID: e.projectID, ID: id})
+	row, err := e.st.MarkDeliveryQueued(e.ctx, sqlcgen.MarkDeliveryQueuedParams{ProjectID: e.projectID, ID: id})
 	if err != nil {
 		e.t.Fatalf("mark queued: %v", err)
 	}
-	return Payload{ProjectID: e.projectID, DeliveryID: id, AttemptCount: n}
+	return Payload{ProjectID: e.projectID, DeliveryID: id, AttemptCount: row.AttemptCount, QueuedAt: row.QueuedAt}
 }
 
 func (e *env) handler(o SenderOptions) *Handler {
@@ -455,7 +455,7 @@ func TestStaleWorkerIsFencedOut(t *testing.T) {
 		`UPDATE deliveries SET status = 'queued', locked_until = NULL WHERE id = $1 AND status = 'in_flight'`, id); err != nil {
 		t.Fatal(err)
 	}
-	pB := Payload{ProjectID: e.projectID, DeliveryID: id, AttemptCount: 1}
+	pB := Payload{ProjectID: e.projectID, DeliveryID: id, AttemptCount: 1, QueuedAt: pA.QueuedAt}
 	if out := e.deliver(h, pB); out != OutcomeSucceeded {
 		t.Fatalf("worker B outcome = %s", out)
 	}
@@ -487,9 +487,10 @@ func TestStaleOrForeignTasksAreSkipped(t *testing.T) {
 
 	other := e.newProject()
 	for name, bad := range map[string]Payload{
-		"other project":       {ProjectID: other, DeliveryID: id, AttemptCount: p.AttemptCount},
-		"stale attempt count": {ProjectID: e.projectID, DeliveryID: id, AttemptCount: p.AttemptCount + 3},
-		"unknown delivery":    {ProjectID: e.projectID, DeliveryID: store.NewUUID(), AttemptCount: 0},
+		"other project":       {ProjectID: other, DeliveryID: id, AttemptCount: p.AttemptCount, QueuedAt: p.QueuedAt},
+		"stale attempt count": {ProjectID: e.projectID, DeliveryID: id, AttemptCount: p.AttemptCount + 3, QueuedAt: p.QueuedAt},
+		"earlier dispatch":    {ProjectID: e.projectID, DeliveryID: id, AttemptCount: p.AttemptCount, QueuedAt: p.QueuedAt.Add(-time.Second)},
+		"unknown delivery":    {ProjectID: e.projectID, DeliveryID: store.NewUUID(), AttemptCount: 0, QueuedAt: p.QueuedAt},
 	} {
 		if out := e.deliver(h, bad); out != OutcomeSkipped {
 			t.Errorf("%s: outcome = %s", name, out)

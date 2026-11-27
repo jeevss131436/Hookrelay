@@ -68,19 +68,24 @@ Read `ARCHITECTURE.md` first. The design decisions D1–D8 referenced below are 
 
 ## Phase 4 — Dispatcher, retries, reaper (~3–4 days)
 
-- [ ] Dispatcher loop: `SKIP LOCKED` batch select, enqueue with `TaskID`, and mark `queued`. Treat `ErrTaskIDConflict` as success.
-- [ ] Reaper loop: stale `queued` goes to `scheduled`; expired `in_flight` goes to `scheduled` and gets a `worker_lost` attempt record.
-- [ ] Graceful shutdown for the worker (§6.5): stop the dispatcher and reaper loops before `asynq.Server.Shutdown()` (the handler side is done in Phase 3).
-- [ ] **End-to-end reliability tests.** These are the heart of the project:
-  - [ ] happy path: event, then delivered, then `succeeded`
-  - [ ] receiver returns 500 three times and then 200: four attempts, ending `succeeded`
-  - [ ] receiver always fails: ends `dead` after `max_attempts` (use a tiny backoff base in tests)
-  - [ ] Redis stopped during ingest: events are delivered after Redis restarts
-  - [ ] Redis flushed while tasks are queued: the reaper recovers them
-  - [ ] worker killed mid-delivery: the reaper recovers it and it ends `succeeded`
-  - [ ] two worker processes: no delivery is marked succeeded twice, and every attempt row is unique
+- [x] Dispatcher loop: `SKIP LOCKED` batch moved to `queued` and committed, **then** enqueued (no Redis call inside a transaction); release on enqueue failure; `ErrTaskIDConflict` is success. Task IDs are unique per dispatch (ARCHITECTURE §3.6).
+- [x] Reaper loop: stale `queued` (past the dispatch lease) goes to `scheduled`; expired `in_flight` gets a `worker_lost` attempt record and the normal retry policy (`scheduled` or `dead`).
+- [x] Graceful shutdown for the worker (§6.5): stop the dispatcher and reaper loops before `asynq.Server.Shutdown()`.
+- [x] Process roles: `worker` (handlers + dispatcher + reaper), `dispatcher`, `reaper`.
+- [x] **End-to-end reliability tests.** These are the heart of the project:
+  - [x] happy path: event, then delivered, then `succeeded`
+  - [x] receiver returns 500 three times and then 200: four attempts, ending `succeeded` (Phase 3 handler test)
+  - [x] receiver always fails: ends `dead` after `max_attempts` (use a tiny backoff base in tests)
+  - [x] Redis down during dispatch: events are delivered after Redis recovers (simulated outage of the enqueue path, plus a real unreachable Redis)
+  - [x] Redis flushed while tasks are queued: the reaper recovers them
+  - [x] worker killed mid-delivery: the reaper recovers it and it ends `succeeded`
+  - [x] two worker processes: no delivery is marked succeeded twice, and every attempt row is unique
 
 **Done when:** all of the scenarios above pass in CI. **This completes the backend MVP.**
+
+> Status: complete. Dispatcher, reaper and full-pipeline tests (real Postgres on the Neon `integration-tests` branch, real
+> Redis/Asynq, mock receivers) pass, also under `-race`. Smoke test: `hookrelay worker` delivered API-ingested events with
+> no manual step; SIGTERM shut it down cleanly (exit 0). Design: ARCHITECTURE §3.6.
 
 ## Phase 5 — Read APIs and operations (~2–3 days)
 

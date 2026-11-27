@@ -62,8 +62,16 @@ run-api: ## Run the API server (uses .env)
 	cd $(BACKEND_DIR) && go run ./cmd/hookrelay api
 
 .PHONY: run-worker
-run-worker: ## Run the delivery worker (Asynq; needs Postgres and Redis)
+run-worker: ## Run the worker: delivery handlers + dispatcher + reaper (needs Postgres and Redis)
 	cd $(BACKEND_DIR) && go run ./cmd/hookrelay worker
+
+.PHONY: run-dispatcher
+run-dispatcher: ## Run only the dispatcher loop
+	cd $(BACKEND_DIR) && go run ./cmd/hookrelay dispatcher
+
+.PHONY: run-reaper
+run-reaper: ## Run only the reaper loop
+	cd $(BACKEND_DIR) && go run ./cmd/hookrelay reaper
 
 .PHONY: run-mockreceiver
 run-mockreceiver: ## Run the mock webhook receiver on 127.0.0.1:9000 (set MOCKRECEIVER_SECRET to verify signatures)

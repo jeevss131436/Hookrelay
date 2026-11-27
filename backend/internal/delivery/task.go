@@ -21,21 +21,28 @@ import (
 // TypeDeliver is the Asynq task type for one delivery attempt.
 const TypeDeliver = "delivery:deliver"
 
-// Payload identifies the delivery a task is for. AttemptCount is the
-// delivery's attempt_count when it was enqueued; the claim only succeeds if
-// the row still has that count, so every enqueue authorizes at most one
-// attempt.
+// Payload identifies one dispatch of a delivery. AttemptCount and QueuedAt
+// are the row's values when it was moved to 'queued'; the worker's claim only
+// succeeds if the row still has both, so every dispatch authorizes at most
+// one attempt, and a task left over from an earlier dispatch is a no-op.
 type Payload struct {
 	ProjectID    pgtype.UUID `json:"project_id"`
 	DeliveryID   pgtype.UUID `json:"delivery_id"`
 	AttemptCount int32       `json:"attempt_count"`
+	QueuedAt     time.Time   `json:"queued_at"`
 }
 
-// TaskID is the Asynq task ID, "{delivery_id}:{attempt_count}". Enqueueing
-// the same delivery twice for the same attempt is rejected by Asynq with
-// asynq.ErrTaskIDConflict, which callers treat as success.
+// TaskID is the Asynq task ID, "{delivery_id}:{attempt_count}:{queued_at µs}":
+// unique per dispatch. Enqueueing the same dispatch twice is rejected by Asynq
+// with asynq.ErrTaskIDConflict, which callers treat as success.
+//
+// queued_at is part of the ID because Asynq keeps the IDs of archived tasks
+// (a task that timed out or whose handler failed). With an ID of only
+// "{delivery_id}:{attempt_count}", every later re-dispatch of that attempt
+// would conflict with the archived task, count as "already enqueued", and the
+// delivery would never run.
 func (p Payload) TaskID() string {
-	return fmt.Sprintf("%s:%d", p.DeliveryID.String(), p.AttemptCount)
+	return fmt.Sprintf("%s:%d:%d", p.DeliveryID.String(), p.AttemptCount, p.QueuedAt.UnixMicro())
 }
 
 // NewTask builds the task for p. MaxRetry(0) is essential: Postgres, not
@@ -75,6 +82,9 @@ func (p Payload) validate() error {
 	}
 	if p.AttemptCount < 0 {
 		return errors.New("delivery task: attempt_count must not be negative")
+	}
+	if p.QueuedAt.IsZero() {
+		return errors.New("delivery task: queued_at is required")
 	}
 	return nil
 }

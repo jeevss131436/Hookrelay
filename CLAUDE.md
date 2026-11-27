@@ -5,7 +5,7 @@ PostgreSQL, a Go worker delivers them to registered endpoints with signed HTTP r
 exponential-backoff retries and a full attempt history, and a Next.js dashboard shows
 what happened.
 
-**Status:** Phases 0–3 are complete: scaffolding; schema and data access; the API (API-key auth, endpoint CRUD, event ingestion); and the delivery core (Asynq worker, Standard Webhooks signing, SSRF-guarded sender, claim/record fencing, retry scheduling in Postgres). Integration tests pass on a Neon test branch with local Redis. Next is Phase 4 (dispatcher, reaper, end-to-end reliability tests). Follow `docs/IMPLEMENTATION_PLAN.md` phase by phase.
+**Status:** Phases 0–4 are complete: scaffolding; schema and data access; the API (API-key auth, endpoint CRUD, event ingestion); the delivery core (Asynq worker, Standard Webhooks signing, SSRF-guarded sender, claim/record fencing, retry scheduling in Postgres); and the dispatcher and reaper with end-to-end reliability tests. Integration tests pass on a Neon test branch with local Redis. Next is Phase 5 (read APIs, manual retry, stats). Follow `docs/IMPLEMENTATION_PLAN.md` phase by phase.
 
 ## Docs (read before making design changes)
 - `docs/PRODUCT_SPEC.md`: what we're building and what is out of scope for the MVP.
@@ -39,7 +39,7 @@ Makefile, docker-compose.yml, .env.example     # root: dev tasks + local Postgre
 .github/workflows/ci.yml                       # gofmt, vet, golangci-lint, sqlc diff, go test -race (PG/Redis services)
 backend/go.mod                                 # module github.com/jeevss131436/Hookrelay/backend
 backend/.golangci.yml, backend/sqlc.yaml       # lint + sqlc config
-backend/cmd/hookrelay/                         # main.go (dispatch), api.go, worker.go, migrate.go, admin.go
+backend/cmd/hookrelay/                         # main.go (subcommands), api.go, worker.go (worker | dispatcher | reaper roles), migrate.go, admin.go
 backend/cmd/mockreceiver/                      # local test receiver (signature check, ?status= ?latency_ms= ?fail_rate=)
 backend/db/migrations/                         # goose SQL migrations (embedded via backend/db/embed.go)
 backend/db/queries/                            # hand-written sqlc queries
@@ -53,6 +53,7 @@ backend/internal/ssrf/                         # IsDisallowed(ip) + registration
 backend/internal/endpoints/                    # endpoint service: validation, SSRF, secret bound to (project, endpoint) id
 backend/internal/ingest/                       # event ingest: one tx = event + fan-out deliveries (outbox); no Redis
 backend/internal/delivery/                     # Asynq task (MaxRetry 0) + handler: claim tx -> sign/send -> record tx; SSRF-guarded Sender; EnqueueOne
+backend/internal/dispatch/                     # Dispatcher (Postgres -> Redis, commit then enqueue, release on failure) + Reaper (stale queued, expired in_flight)
 backend/internal/signing/                      # Standard Webhooks HMAC-SHA256 sign/verify
 backend/internal/backoff/                      # exponential backoff, full jitter, Retry-After (base 5m, cap 6h)
 backend/internal/mockreceiver/                 # receiver handler used by cmd/mockreceiver and tests
@@ -63,7 +64,7 @@ neon.ts, package.json, .neon                   # Neon project config (`neon depl
 ```
 Database in prod: Neon project `soft-silence-60663214`, branch `production` (PostgreSQL 18). Pooled `DATABASE_URL` for app
 traffic, `DATABASE_URL_UNPOOLED` for migrations and session state (ARCHITECTURE pitfall 10). Never point tests at it.
-Planned (later phases): `backend/internal/dispatch` (dispatcher + reaper, Phase 4), `loadtest/` (k6).
+Planned (later phases): `loadtest/` (k6).
 
 ## Commands
 Run from the repo root. On Windows, use Git Bash (Makefile recipes are POSIX sh).
@@ -76,7 +77,8 @@ make dev-down          # stop services (dev-reset also deletes the Postgres volu
 make migrate           # hookrelay migrate up   (also: migrate-down, migrate-status)
 make create-project NAME="Acme"   # project + first API key; prints the key ONCE
 make run-api           # go run ./cmd/hookrelay api  -> http://localhost:8080/healthz, /readyz
-make run-worker        # go run ./cmd/hookrelay worker (Asynq delivery handlers)
+make run-worker        # go run ./cmd/hookrelay worker (handlers + dispatcher + reaper; delivers ingested events)
+make run-dispatcher / run-reaper   # run one loop alone (optional; `worker` already includes both)
 make run-mockreceiver  # test receiver on 127.0.0.1:9000 (MOCKRECEIVER_SECRET=whsec_... to verify signatures)
 make sqlc              # regenerate internal/store/sqlcgen after editing db/queries or migrations
 make sqlc-check        # sqlc diff + sqlc vet (fails if generated code is stale)
@@ -88,7 +90,8 @@ make build             # bin/hookrelay
 ```
 CLI directly: `hookrelay migrate up|down|status|version`, `hookrelay admin create-project --name N [--key-name K]`,
 `hookrelay admin create-key --project ID [--name K]`,
-`hookrelay admin enqueue-delivery --project ID --delivery ID` (hand one pending/scheduled delivery to the worker; the Phase 4 dispatcher automates this). `admin` and `migrate` log to stderr and print results to stdout.
+`hookrelay admin enqueue-delivery --project ID --delivery ID` (hand one pending/scheduled delivery to the queue now, ignoring next_attempt_at; the dispatcher does this automatically).
+Process roles: `hookrelay api | worker | dispatcher | reaper`; any number of each may run (SKIP LOCKED + fencing). `admin` and `migrate` log to stderr and print results to stdout.
 
 sqlc needs cgo to `go install`. On Windows without a C compiler, download the release binary
 (`sqlc_1.31.1_windows_<arch>.zip` from github.com/sqlc-dev/sqlc/releases) into `~/go/bin`.
@@ -104,7 +107,7 @@ startup error, and all problems are reported together. When adding a variable, a
 - Go: pass `context.Context` everywhere. Wrap errors with `fmt.Errorf("...: %w", err)`. Log with `slog` and include `delivery_id`/`event_id`/`request_id` fields. Do not use global state beyond `main`.
 - SQL is hand-written in `db/queries`, then sqlc generates the code. Never edit generated files.
 - Schema changes go in a new goose migration with a working `-- +goose Down`. Never edit an applied migration. Run `make sqlc` afterwards; `docs/ARCHITECTURE.md §4` summarizes the schema and must be kept in sync.
-- Tenant-owned tables carry `project_id`, and child rows use composite FKs `(project_id, id)`. Every query on tenant data takes `project_id`. The only exception is `GetActiveAPIKeyByHash`, which is how the project is determined.
+- Tenant-owned tables carry `project_id`, and child rows use composite FKs `(project_id, id)`. Every query on tenant data takes `project_id`. The exceptions are `GetActiveAPIKeyByHash` (how the project is determined) and the dispatcher/reaper maintenance queries in `db/queries/deliveries.sql`, which move rows between internal states system-wide and never return tenant data.
 - Multi-statement writes go through `store.InTx`. Never make network calls other than to Postgres inside it.
 - Secrets: never log plaintext API keys, signing secrets or the encryption key. `secrets.Key` and `secrets.APIKey` redact themselves in fmt/slog; keep it that way for any new secret type. Use `store.IsUniqueViolation`/`IsForeignKeyViolation`/`IsNotFound` instead of matching error strings.
 - HTTP errors use the envelope `{"error":{"code","message"}}` (see `writeError` in `internal/httpapi`).

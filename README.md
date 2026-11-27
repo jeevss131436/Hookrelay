@@ -43,10 +43,10 @@ The full design is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | REST API | `POST /v1/events` (idempotent ingest with fan-out in one transaction) and `/v1/endpoints` CRUD. See [`docs/API.md`](docs/API.md). |
 | Security | Bearer API keys (hash lookup; revoked keys rejected); SSRF checks on endpoint URLs at registration *and* at connect time (DNS-rebinding safe); signing secrets bound to their endpoint |
 | Delivery worker | `hookrelay worker`: Asynq task handler that claims a delivery with a conditional update, signs it (Standard Webhooks HMAC-SHA256), POSTs the exact stored bytes, and records the attempt, fenced on `attempt_count`. Failures are rescheduled in PostgreSQL with exponential backoff and jitter, or marked `dead`. |
+| Dispatcher & reaper | The dispatcher moves due deliveries from PostgreSQL into Redis (commit first, enqueue after; releases them if Redis is down). The reaper re-dispatches queued deliveries whose task never ran and recovers in-flight deliveries whose worker died. Both run inside `hookrelay worker`, or alone as `hookrelay dispatcher` / `hookrelay reaper`. |
 | Mock receiver | `cmd/mockreceiver`: verifies signatures, logs `webhook-id`, and takes `?status=`, `?latency_ms=`, `?fail_rate=` |
 
-Not built yet: the dispatcher and reaper (Phase 4) and the dashboard. Until the dispatcher exists, a
-pending delivery is handed to the worker by hand with `hookrelay admin enqueue-delivery`.
+Not built yet: the read APIs and manual retry (Phase 5) and the dashboard (Phase 6).
 
 ## Tech stack
 
@@ -109,6 +109,7 @@ backend/
   internal/migrate/     migration runner
   internal/secrets/     AES-GCM encryption, API keys, signing secrets
   internal/delivery/    Asynq task + handler (claim, send, record), SSRF-guarded HTTP sender
+  internal/dispatch/    dispatcher and reaper loops
   internal/signing/     Standard Webhooks sign/verify
   internal/backoff/     retry schedule (exponential, full jitter, Retry-After)
 docs/                   product spec, architecture, implementation plan
@@ -131,8 +132,8 @@ Unknown or malformed `HOOKRELAY_*` variables stop the process at startup. Requir
 | 1 | Schema, migrations, sqlc, secrets, admin CLI | ✅ Done (live on Neon) |
 | 2 | REST API: API-key auth, endpoint CRUD, event ingest with fan-out and idempotency | ✅ Done |
 | 3 | Delivery core: signing, SSRF-safe HTTP sender, worker claim/record, retry scheduling | ✅ Done |
-| 4 | Dispatcher, reaper, end-to-end reliability tests | Next |
-| 5 | Read APIs, manual retry, stats | |
+| 4 | Dispatcher, reaper, end-to-end reliability tests | ✅ Done |
+| 5 | Read APIs, manual retry, stats | Next |
 | 6 | Next.js dashboard | |
 | 7 | k6 load tests and published benchmarks | |
 | 8 | Deployment | |

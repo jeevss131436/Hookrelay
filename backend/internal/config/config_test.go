@@ -58,6 +58,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.WorkerConcurrency != 50 {
 		t.Errorf("WorkerConcurrency = %d, want 50", cfg.WorkerConcurrency)
 	}
+	if cfg.DispatchInterval != 500*time.Millisecond || cfg.DispatchBatchSize != 500 || cfg.DispatchLease != 5*time.Minute ||
+		cfg.ReaperInterval != 30*time.Second || cfg.ReaperBatchSize != 500 {
+		t.Errorf("unexpected dispatcher/reaper defaults: %+v", cfg)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -66,12 +70,18 @@ func TestLoadOverrides(t *testing.T) {
 	env["HOOKRELAY_HTTP_ADDR"] = "127.0.0.1:9000"
 	env["HOOKRELAY_SHUTDOWN_TIMEOUT"] = "5s"
 	env["HOOKRELAY_WORKER_CONCURRENCY"] = "8"
+	env["HOOKRELAY_DISPATCH_INTERVAL"] = "250ms"
+	env["HOOKRELAY_DISPATCH_BATCH_SIZE"] = "100"
+	env["HOOKRELAY_DISPATCH_LEASE"] = "2m"
+	env["HOOKRELAY_REAPER_INTERVAL"] = "10s"
+	env["HOOKRELAY_REAPER_BATCH_SIZE"] = "50"
 	cfg, err := load(env)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if cfg.LogLevel != slog.LevelDebug || cfg.HTTPAddr != "127.0.0.1:9000" || cfg.ShutdownTimeout != 5*time.Second ||
-		cfg.WorkerConcurrency != 8 {
+		cfg.WorkerConcurrency != 8 || cfg.DispatchInterval != 250*time.Millisecond || cfg.DispatchBatchSize != 100 ||
+		cfg.DispatchLease != 2*time.Minute || cfg.ReaperInterval != 10*time.Second || cfg.ReaperBatchSize != 50 {
 		t.Errorf("overrides not applied: %+v", cfg)
 	}
 }
@@ -109,6 +119,11 @@ func TestLoadErrors(t *testing.T) {
 		{"unknown var", func(e map[string]string) { e["HOOKRELAY_HTTP_ADRR"] = ":1" }, "HOOKRELAY_HTTP_ADRR: unknown variable"},
 		{"zero concurrency", func(e map[string]string) { e["HOOKRELAY_WORKER_CONCURRENCY"] = "0" }, "HOOKRELAY_WORKER_CONCURRENCY: must be an integer from 1 to 1000"},
 		{"huge concurrency", func(e map[string]string) { e["HOOKRELAY_WORKER_CONCURRENCY"] = "5000" }, "HOOKRELAY_WORKER_CONCURRENCY"},
+		{"short dispatch lease", func(e map[string]string) { e["HOOKRELAY_DISPATCH_LEASE"] = "5s" }, "HOOKRELAY_DISPATCH_LEASE (5s) must be at least 30s"},
+		{"slow dispatch interval", func(e map[string]string) { e["HOOKRELAY_DISPATCH_INTERVAL"] = "2m" }, "HOOKRELAY_DISPATCH_INTERVAL (2m0s) must be at most 1m"},
+		{"zero dispatch batch", func(e map[string]string) { e["HOOKRELAY_DISPATCH_BATCH_SIZE"] = "0" }, "HOOKRELAY_DISPATCH_BATCH_SIZE"},
+		{"bad reaper interval", func(e map[string]string) { e["HOOKRELAY_REAPER_INTERVAL"] = "often" }, "HOOKRELAY_REAPER_INTERVAL"},
+		{"huge reaper batch", func(e map[string]string) { e["HOOKRELAY_REAPER_BATCH_SIZE"] = "20000" }, "HOOKRELAY_REAPER_BATCH_SIZE"},
 		{"non-numeric concurrency", func(e map[string]string) { e["HOOKRELAY_WORKER_CONCURRENCY"] = "many" }, "HOOKRELAY_WORKER_CONCURRENCY"},
 		{
 			"task timeout not above http timeout",
