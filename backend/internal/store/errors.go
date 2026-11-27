@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 
@@ -45,6 +46,17 @@ func isPgError(err error, code, constraint string) bool {
 		return false
 	}
 	return constraint == "" || pgErr.ConstraintName == constraint
+}
+
+// NewUUID returns a random (version 4) UUID, the same kind the database's
+// gen_random_uuid() default produces. Use it when an ID must be known before
+// INSERT, e.g. to bind an endpoint's encrypted secret to its ID.
+func NewUUID() pgtype.UUID {
+	var b [16]byte
+	_, _ = rand.Read(b[:])      // crypto/rand.Read never returns an error.
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 9562 variant
+	return pgtype.UUID{Bytes: b, Valid: true}
 }
 
 // ParseUUID parses a textual UUID (e.g. from a CLI flag or URL path).

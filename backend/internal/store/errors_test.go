@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -31,6 +32,20 @@ func TestErrorClassifiers(t *testing.T) {
 	}
 	if !IsNotFound(fmt.Errorf("x: %w", pgx.ErrNoRows)) || IsNotFound(errors.New("x")) {
 		t.Error("IsNotFound wrong")
+	}
+}
+
+func TestNewUUID(t *testing.T) {
+	a, b := NewUUID(), NewUUID()
+	if !a.Valid || a == b {
+		t.Fatal("NewUUID must return distinct valid UUIDs")
+	}
+	s := a.String()
+	if len(s) != 36 || s[14] != '4' || !strings.ContainsRune("89ab", rune(s[19])) {
+		t.Errorf("not a v4 UUID: %s", s)
+	}
+	if parsed, err := ParseUUID(s); err != nil || parsed != a {
+		t.Errorf("round trip failed: %v", err)
 	}
 }
 

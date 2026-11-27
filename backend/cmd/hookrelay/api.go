@@ -11,7 +11,12 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/jeevss131436/Hookrelay/backend/internal/config"
+	"github.com/jeevss131436/Hookrelay/backend/internal/endpoints"
 	"github.com/jeevss131436/Hookrelay/backend/internal/httpapi"
+	"github.com/jeevss131436/Hookrelay/backend/internal/ingest"
+	"github.com/jeevss131436/Hookrelay/backend/internal/secrets"
+	"github.com/jeevss131436/Hookrelay/backend/internal/ssrf"
 	"github.com/jeevss131436/Hookrelay/backend/internal/store"
 )
 
@@ -36,8 +41,28 @@ func runAPI(ctx context.Context, e *cmdEnv) error {
 	rdb := redis.NewClient(redisOpts)
 	defer func() { _ = rdb.Close() }()
 
+	cipher, err := secrets.NewCipher(cfg.EncryptionKey)
+	if err != nil {
+		return fmt.Errorf("init secret cipher: %w", err)
+	}
+	st := store.New(pool)
+	// Redis is used only for /readyz here: ingestion writes to PostgreSQL
+	// alone (transactional outbox) and keeps working when Redis is down.
+	api := httpapi.NewAPI(log, st,
+		endpoints.NewService(st, cipher, ssrf.Policy{
+			RequireHTTPS: cfg.Env == config.EnvProduction,
+			AllowPrivate: cfg.AllowPrivateTargets,
+		}),
+		ingest.NewService(st),
+	)
+	if cfg.AllowPrivateTargets {
+		log.Warn("HOOKRELAY_ALLOW_PRIVATE_TARGETS=true: SSRF address checks are disabled (development only)")
+	}
+
 	srv := &http.Server{
-		Handler:           httpapi.NewRouter(log, []httpapi.Check{httpapi.PostgresCheck(pool), httpapi.RedisCheck(rdb)}),
+		Handler: httpapi.NewRouter(log,
+			[]httpapi.Check{httpapi.PostgresCheck(pool), httpapi.RedisCheck(rdb)},
+			api.Routes()),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,

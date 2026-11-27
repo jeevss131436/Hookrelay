@@ -45,6 +45,11 @@ type Config struct {
 	DatabaseURLUnpooled string
 	RedisURL            string
 
+	// AllowPrivateTargets disables SSRF address checks so endpoints may point
+	// at localhost/private networks. Local development only; rejected in
+	// production.
+	AllowPrivateTargets bool
+
 	// EncryptionKey encrypts endpoint signing secrets at rest (AES-256-GCM).
 	// secrets.Key redacts itself in fmt and slog output.
 	EncryptionKey secrets.Key
@@ -69,6 +74,7 @@ var knownVars = map[string]bool{
 	"HOOKRELAY_TASK_TIMEOUT":          true,
 	"HOOKRELAY_DELIVERY_LEASE":        true,
 	"HOOKRELAY_ENCRYPTION_KEY":        true,
+	"HOOKRELAY_ALLOW_PRIVATE_TARGETS": true,
 }
 
 // Load builds a Config from the given environment. lookup behaves like
@@ -117,6 +123,17 @@ func Load(lookup func(string) (string, bool), environ []string) (*Config, error)
 	if cfg.DatabaseURLUnpooled != "" && cfg.DatabaseURLUnpooled != cfg.DatabaseURL {
 		l.validateDatabaseURL("DATABASE_URL_UNPOOLED", cfg.DatabaseURLUnpooled, cfg.Env)
 	}
+	switch v := l.optional("HOOKRELAY_ALLOW_PRIVATE_TARGETS", "false"); v {
+	case "false":
+	case "true":
+		cfg.AllowPrivateTargets = true
+		if cfg.Env == EnvProduction {
+			l.errf("HOOKRELAY_ALLOW_PRIVATE_TARGETS: must not be true in production (it disables SSRF protection)")
+		}
+	default:
+		l.errf("HOOKRELAY_ALLOW_PRIVATE_TARGETS: must be true or false (got %q)", v)
+	}
+
 	if raw := l.required("HOOKRELAY_ENCRYPTION_KEY"); raw != "" {
 		key, err := secrets.ParseKey(raw)
 		if err != nil {

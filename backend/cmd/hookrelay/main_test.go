@@ -49,6 +49,9 @@ func setTestEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("HOOKRELAY_ENV", "test")
 	t.Setenv("DATABASE_URL", "postgres://u:p@localhost:1/db?sslmode=disable")
+	// Never inherit the developer's real (e.g. Neon production) direct URL:
+	// `migrate` uses it, so a leaked value would point tests at a real database.
+	t.Setenv("DATABASE_URL_UNPOOLED", "")
 	t.Setenv("REDIS_URL", "redis://localhost:6379/0")
 	t.Setenv("HOOKRELAY_ENCRYPTION_KEY", "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=") // test-only key
 }

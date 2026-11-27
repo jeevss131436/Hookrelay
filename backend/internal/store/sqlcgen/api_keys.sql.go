@@ -52,17 +52,18 @@ func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (Cre
 }
 
 const getActiveAPIKeyByHash = `-- name: GetActiveAPIKeyByHash :one
-SELECT id, project_id, name, prefix
+SELECT id, project_id, name, prefix, last_used_at
 FROM api_keys
 WHERE key_hash = $1
   AND revoked_at IS NULL
 `
 
 type GetActiveAPIKeyByHashRow struct {
-	ID        pgtype.UUID
-	ProjectID pgtype.UUID
-	Name      string
-	Prefix    string
+	ID         pgtype.UUID
+	ProjectID  pgtype.UUID
+	Name       string
+	Prefix     string
+	LastUsedAt *time.Time
 }
 
 // Authentication entry point: resolves a presented key's hash to its project.
@@ -76,6 +77,7 @@ func (q *Queries) GetActiveAPIKeyByHash(ctx context.Context, keyHash []byte) (Ge
 		&i.ProjectID,
 		&i.Name,
 		&i.Prefix,
+		&i.LastUsedAt,
 	)
 	return i, err
 }
@@ -144,4 +146,18 @@ func (q *Queries) RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (int
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const touchAPIKeyLastUsed = `-- name: TouchAPIKeyLastUsed :exec
+UPDATE api_keys
+SET last_used_at = now()
+WHERE id = $1
+  AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')
+`
+
+// Throttled: the auth middleware calls this only when last_used_at is older
+// than a minute, and the WHERE clause keeps concurrent calls cheap no-ops.
+func (q *Queries) TouchAPIKeyLastUsed(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, touchAPIKeyLastUsed, id)
+	return err
 }
