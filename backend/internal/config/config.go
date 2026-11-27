@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,12 +55,17 @@ type Config struct {
 	// secrets.Key redacts itself in fmt and slog output.
 	EncryptionKey secrets.Key
 
-	// Delivery timing. Not used until Phase 3/4, but validated now so the
-	// lease invariant (ARCHITECTURE.md §6.3) can never be misconfigured:
+	// Delivery timing, validated so the lease invariant (ARCHITECTURE.md
+	// §6.3) can never be misconfigured:
 	// DeliveryLease > TaskTimeout > DeliveryHTTPTimeout.
 	DeliveryHTTPTimeout time.Duration
 	TaskTimeout         time.Duration
 	DeliveryLease       time.Duration
+
+	// WorkerConcurrency is how many delivery tasks one worker process runs
+	// at once (Asynq Concurrency). Delivery is I/O-bound, so it can be well
+	// above the CPU count (ARCHITECTURE §6.1).
+	WorkerConcurrency int
 }
 
 // knownVars lists every HOOKRELAY_* variable the application reads. Any other
@@ -75,6 +81,7 @@ var knownVars = map[string]bool{
 	"HOOKRELAY_DELIVERY_LEASE":        true,
 	"HOOKRELAY_ENCRYPTION_KEY":        true,
 	"HOOKRELAY_ALLOW_PRIVATE_TARGETS": true,
+	"HOOKRELAY_WORKER_CONCURRENCY":    true,
 }
 
 // Load builds a Config from the given environment. lookup behaves like
@@ -99,6 +106,7 @@ func Load(lookup func(string) (string, bool), environ []string) (*Config, error)
 		DeliveryHTTPTimeout: l.duration("HOOKRELAY_DELIVERY_HTTP_TIMEOUT", 10*time.Second),
 		TaskTimeout:         l.duration("HOOKRELAY_TASK_TIMEOUT", 30*time.Second),
 		DeliveryLease:       l.duration("HOOKRELAY_DELIVERY_LEASE", 60*time.Second),
+		WorkerConcurrency:   l.intRange("HOOKRELAY_WORKER_CONCURRENCY", 50, 1, 1000),
 	}
 
 	switch cfg.Env {
@@ -240,4 +248,17 @@ func (l *loader) duration(name string, def time.Duration) time.Duration {
 		return 0
 	}
 	return d
+}
+
+func (l *loader) intRange(name string, def, lo, hi int) int {
+	v, ok := l.get(name)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < lo || n > hi {
+		l.errf("%s: must be an integer from %d to %d (got %q)", name, lo, hi, v)
+		return 0
+	}
+	return n
 }

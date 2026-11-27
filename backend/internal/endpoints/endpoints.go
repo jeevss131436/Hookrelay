@@ -102,6 +102,18 @@ func secretAAD(projectID, endpointID pgtype.UUID) []byte {
 	return append(aad, endpointID.Bytes[:]...)
 }
 
+// DecryptSecret decrypts an endpoint's stored signing secret. It fails for a
+// wrong key, tampering, or a ciphertext copied from another endpoint (the
+// ciphertext is bound to projectID and endpointID). The delivery worker uses
+// it to sign requests.
+func DecryptSecret(c *secrets.Cipher, projectID, endpointID pgtype.UUID, ciphertext []byte) (string, error) {
+	pt, err := c.Decrypt(ciphertext, secretAAD(projectID, endpointID))
+	if err != nil {
+		return "", fmt.Errorf("decrypt endpoint secret: %w", err)
+	}
+	return string(pt), nil
+}
+
 // Create validates the input (including a DNS-based SSRF check, done before
 // any transaction), generates and encrypts a signing secret bound to a new
 // endpoint ID, and inserts the endpoint. It returns the plaintext secret
@@ -275,12 +287,8 @@ func (s *Service) Secret(ctx context.Context, projectID, id pgtype.UUID) (string
 	if err != nil {
 		return "", fmt.Errorf("get endpoint secret: %w", err)
 	}
-	pt, err := s.cipher.Decrypt(ct, secretAAD(projectID, id))
-	if err != nil {
-		// Wrong key, tampering, or a ciphertext moved from another row.
-		return "", fmt.Errorf("decrypt endpoint secret: %w", err)
-	}
-	return string(pt), nil
+	// Fails on a wrong key, tampering, or a ciphertext moved from another row.
+	return DecryptSecret(s.cipher, projectID, id, ct)
 }
 
 func urlProblem(err error) string {

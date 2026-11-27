@@ -77,7 +77,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "api":
 		cmd = command{run: runAPI}
 	case "worker":
-		cmd = command{run: notImplemented("worker", "Phase 3-4")}
+		cmd = command{run: runWorker}
 	case "migrate":
 		cmd = command{run: runMigrate, oneShot: true}
 	case "admin":
@@ -132,10 +132,4 @@ type redisLogger struct{ log *slog.Logger }
 
 func (l redisLogger) Printf(ctx context.Context, format string, v ...any) {
 	l.log.WarnContext(ctx, fmt.Sprintf(format, v...))
-}
-
-func notImplemented(cmd, phase string) func(context.Context, *cmdEnv) error {
-	return func(context.Context, *cmdEnv) error {
-		return fmt.Errorf("%s: not implemented yet (planned for %s of docs/IMPLEMENTATION_PLAN.md)", cmd, phase)
-	}
 }

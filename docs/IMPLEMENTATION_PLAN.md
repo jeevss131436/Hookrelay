@@ -54,20 +54,23 @@ Read `ARCHITECTURE.md` first. The design decisions D1–D8 referenced below are 
 
 ## Phase 3 — Delivery core (~4–5 days)
 
-- [ ] `internal/signing`: Standard Webhooks sign/verify, tested against published test vectors.
-- [ ] `internal/delivery/sender`: shared `http.Client`, 10 s timeout, no redirects, SSRF-checking `Dialer.Control`, response body truncated to 4 KB, error classification (`timeout`, `connection`, `dns`, `tls`, `http_status`, `ssrf_blocked`).
-- [ ] Asynq `deliver` handler: **claim**, then send, then **record** (D3, D4), all fenced on `status` and `attempt_count`.
-- [ ] `internal/backoff`: exponential backoff with full jitter and `Retry-After` support. Unit tests use a seeded RNG.
-- [ ] `cmd/mockreceiver`: verifies signatures and lets you set `?fail_rate=`, `?latency_ms=` and `?status=`. Logs `webhook-id` so duplicates can be counted.
+- [x] `internal/signing`: Standard Webhooks sign/verify, tested against published test vectors.
+- [x] `internal/delivery/sender`: shared `http.Client`, 10 s timeout, no redirects, SSRF-checking `Dialer.Control`, response body truncated to 4 KB, error classification (`timeout`, `connection`, `dns`, `tls`, `http_status`, `ssrf_blocked`).
+- [x] Asynq `deliver` handler: **claim**, then send, then **record** (D3, D4), all fenced on `status` and `attempt_count`.
+- [x] `internal/backoff`: exponential backoff with full jitter and `Retry-After` support. Unit tests use a seeded RNG.
+- [x] `cmd/mockreceiver`: verifies signatures and lets you set `?fail_rate=`, `?latency_ms=` and `?status=`. Logs `webhook-id` so duplicates can be counted.
+- [x] Failure path (pulled forward from Phase 4): `scheduled` with `next_attempt_at` from the DB clock, or `dead` once `max_attempts` is reached or the failure is permanent.
+- [x] `hookrelay worker` (Asynq server, configurable concurrency, graceful shutdown of handlers) and `hookrelay admin enqueue-delivery` for manual hand-off.
 
 **Done when:** manually enqueuing a delivery task makes a signed request reach mockreceiver, and the outcome is recorded.
+
+> Status: complete. Delivery integration tests (success, 500, timeout, Retry-After, last attempt goes dead, retry then succeed, DNS rebinding, duplicate tasks, stale-worker fencing, foreign or stale tasks, endpoint disabled after dispatch, undecryptable secret, and two tests through real Redis/Asynq) pass against the Neon `integration-tests` branch and local Redis, also under `-race` (in a Linux container). Smoke test of the real binaries: admin enqueue, then the worker, then mockreceiver verified the signature, then `succeeded`. Design notes are in ARCHITECTURE §3.5. The backoff base changed from 30 s to 5 m to match the documented ~24 h window (§3.2).
 
 ## Phase 4 — Dispatcher, retries, reaper (~3–4 days)
 
 - [ ] Dispatcher loop: `SKIP LOCKED` batch select, enqueue with `TaskID`, and mark `queued`. Treat `ErrTaskIDConflict` as success.
-- [ ] Failure path: `scheduled` with `next_attempt_at`, or `dead` once `max_attempts` is reached.
 - [ ] Reaper loop: stale `queued` goes to `scheduled`; expired `in_flight` goes to `scheduled` and gets a `worker_lost` attempt record.
-- [ ] Graceful shutdown for the worker (§6.5).
+- [ ] Graceful shutdown for the worker (§6.5): stop the dispatcher and reaper loops before `asynq.Server.Shutdown()` (the handler side is done in Phase 3).
 - [ ] **End-to-end reliability tests.** These are the heart of the project:
   - [ ] happy path: event, then delivered, then `succeeded`
   - [ ] receiver returns 500 three times and then 200: four attempts, ending `succeeded`
