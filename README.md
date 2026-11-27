@@ -4,9 +4,9 @@ Developer-first webhook infrastructure. You send an event once over a REST API. 
 stores it in PostgreSQL and delivers it to every subscribed endpoint with signed HTTP requests,
 automatic exponential-backoff retries, and a full per-attempt delivery history.
 
-> **Status: early development. Phases 0–1 of 8 are complete.** The foundation, database schema,
-> data access, secret management and admin CLI are built, and the schema is live on Neon. Event
-> ingestion, webhook delivery and the dashboard are not built yet. See [Roadmap](#roadmap).
+> **Status: early development. Phases 0–2 of 8 are complete.** The foundation, database schema,
+> admin CLI, and the REST API (API-key auth, endpoint management, event ingestion) are built and
+> tested against Neon. Webhook delivery, retries and the dashboard are not built yet. See [Roadmap](#roadmap).
 
 ## How it works
 
@@ -40,8 +40,11 @@ The full design is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | Admin CLI | `hookrelay admin create-project` / `create-key` (the plaintext key is shown once) |
 | Hosting | PostgreSQL 18 on **Neon**: pooled URL for the app, direct URL for migrations |
 | CI | GitHub Actions: gofmt, go vet, golangci-lint, sqlc drift check, `go test -race` with Postgres and Redis |
+| REST API | `POST /v1/events` (idempotent ingest with fan-out in one transaction) and `/v1/endpoints` CRUD. See [`docs/API.md`](docs/API.md). |
+| Security | Bearer API keys (hash lookup; revoked keys rejected); SSRF checks on endpoint URLs; signing secrets bound to their endpoint |
 
-Not built yet: the event/endpoint REST API, delivery workers, retries, and the dashboard.
+Not built yet: delivery workers, signing of outgoing requests, retries, and the dashboard. Ingested events
+currently wait as `pending` deliveries in PostgreSQL.
 
 ## Tech stack
 
@@ -120,8 +123,8 @@ Unknown or malformed `HOOKRELAY_*` variables stop the process at startup. Requir
 |---|---|---|
 | 0 | Scaffolding, config, logging, health checks, CI | ✅ Done |
 | 1 | Schema, migrations, sqlc, secrets, admin CLI | ✅ Done (live on Neon) |
-| 2 | REST API: API-key auth, endpoint CRUD, event ingest with fan-out and idempotency | Next |
-| 3 | Delivery core: signing, SSRF-safe HTTP sender, worker claim/record | |
+| 2 | REST API: API-key auth, endpoint CRUD, event ingest with fan-out and idempotency | ✅ Done |
+| 3 | Delivery core: signing, SSRF-safe HTTP sender, worker claim/record | Next |
 | 4 | Dispatcher, retries with backoff, reaper, reliability tests | |
 | 5 | Read APIs, manual retry, stats | |
 | 6 | Next.js dashboard | |
@@ -131,6 +134,5 @@ Unknown or malformed `HOOKRELAY_*` variables stop the process at startup. Requir
 Details are in [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md). The product scope is in
 [`docs/PRODUCT_SPEC.md`](docs/PRODUCT_SPEC.md).
 
-**Known gaps:** the PostgreSQL integration tests have not yet run locally (Docker is not set up on
-the dev machine) and will run for the first time in CI. Redis is not yet provisioned for the Neon
-setup, so `/readyz` reports it as unavailable there.
+**Known gaps:** Redis is not yet provisioned (no local Docker, nothing on Neon), so `/readyz` reports
+it as unavailable. Ingestion does not need it.

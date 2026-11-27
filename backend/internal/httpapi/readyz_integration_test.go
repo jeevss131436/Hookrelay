@@ -33,7 +33,7 @@ func TestReadyzIntegration(t *testing.T) {
 	rdb := redis.NewClient(opts)
 	t.Cleanup(func() { _ = rdb.Close() })
 
-	h := NewRouter(discardLogger(), []Check{PostgresCheck(pool), RedisCheck(rdb)})
+	h := NewRouter(discardLogger(), []Check{PostgresCheck(pool), RedisCheck(rdb)}, nil)
 	rec := do(t, h, http.MethodGet, "/readyz", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())

@@ -11,8 +11,8 @@ import (
 )
 
 // NewRouter wires middleware and routes. checks are the dependencies probed
-// by /readyz.
-func NewRouter(log *slog.Logger, checks []Check) http.Handler {
+// by /readyz. v1, if non-nil, is mounted at /v1 (see API.Routes).
+func NewRouter(log *slog.Logger, checks []Check, v1 http.Handler) http.Handler {
 	r := chi.NewRouter()
 
 	// RequestID runs first so every later log line and error carries the ID;
@@ -31,6 +31,9 @@ func NewRouter(log *slog.Logger, checks []Check) http.Handler {
 	r.Get("/healthz", handleHealthz)
 	r.Get("/readyz", handleReadyz(log, checks))
 
+	if v1 != nil {
+		r.Mount("/v1", v1)
+	}
 	return r
 }
 
@@ -46,8 +49,9 @@ type errorBody struct {
 }
 
 type errorDetail struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code    string            `json:"code"`
+	Message string            `json:"message"`
+	Details map[string]string `json:"details,omitempty"`
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {

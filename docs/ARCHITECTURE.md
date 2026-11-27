@@ -262,6 +262,17 @@ API key once, to stdout, and logs only its prefix.
 
 ## 5. REST API
 
+> The implemented routes, with request/response examples and the exact error codes, are documented in
+> [`API.md`](API.md), which is authoritative for anything already built. The tables below are the full MVP plan.
+>
+> Phase 2 implementation decisions:
+> - Endpoint IDs are generated in Go (`store.NewUUID`) so the signing secret's AES-GCM ciphertext can be bound, as associated data, to `(project_id, endpoint_id)` before the INSERT.
+> - Endpoint URLs pass `internal/ssrf` at registration, including a DNS check of every resolved address. Phase 3's dialer must re-check at connect time.
+> - Malformed path IDs and other projects' endpoints return `404`, the same as missing ones.
+> - Disabling or deleting an endpoint cancels its `pending`/`scheduled` deliveries in the same transaction.
+> - The endpoint limit (100) is enforced under a `SELECT … FOR UPDATE` lock on the project row.
+> - `last_used_at` is updated at most once per minute per key.
+
 **Conventions**
 - Base path `/v1`. JSON in and out. Auth uses `Authorization: Bearer hr_<random>`. Every query is scoped to the key's project.
 - List endpoints use cursor pagination (`?limit=50&cursor=<opaque>`, ordered by `created_at DESC, id DESC`) and return `{data: [...], next_cursor}`.

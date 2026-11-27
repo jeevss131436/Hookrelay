@@ -60,12 +60,25 @@ func newRequestID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// logAttrsKey holds a *[]slog.Attr that inner handlers (e.g. authentication)
+// append to, so the outer Logger's line can include them.
+type logAttrsKey struct{}
+
+// addLogAttrs adds attributes to the current request's access log line.
+func addLogAttrs(ctx context.Context, attrs ...slog.Attr) {
+	if p, ok := ctx.Value(logAttrsKey{}).(*[]slog.Attr); ok {
+		*p = append(*p, attrs...)
+	}
+}
+
 // Logger emits one structured log line per request.
 func Logger(log *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+			extra := &[]slog.Attr{}
+			r = r.WithContext(context.WithValue(r.Context(), logAttrsKey{}, extra))
 			next.ServeHTTP(ww, r)
 
 			status := ww.Status()
@@ -76,14 +89,15 @@ func Logger(log *slog.Logger) func(http.Handler) http.Handler {
 			if status >= 500 {
 				level = slog.LevelError
 			}
-			log.LogAttrs(r.Context(), level, "http request",
+			attrs := append([]slog.Attr{
 				slog.String("request_id", RequestIDFromContext(r.Context())),
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
 				slog.Int("status", status),
 				slog.Int("bytes", ww.BytesWritten()),
 				slog.Int64("duration_ms", time.Since(start).Milliseconds()),
-			)
+			}, *extra...)
+			log.LogAttrs(r.Context(), level, "http request", attrs...)
 		})
 	}
 }

@@ -33,21 +33,24 @@ Read `ARCHITECTURE.md` first. The design decisions D1–D8 referenced below are 
 
 **Done when:** migrations apply cleanly to an empty DB, and the admin CLI produces a usable key.
 
-> Status: code complete, and unit tests, lint and `sqlc diff` pass. The PostgreSQL integration tests (migrations up/down, queries, constraints, tenant isolation, admin CLI) are written but **have not been run yet**, because no PostgreSQL was reachable on the dev machine. Run `make dev-up && make ci` to verify.
+> Status: complete. All PostgreSQL integration tests (migrations up/down/up, queries, constraints, tenant isolation, admin CLI) passed on a Neon test branch.
 
 ## Phase 2 — API: endpoints and ingest (~4–5 days)
 
-- [ ] Chi router, JSON error helpers, and auth middleware (hash lookup, `last_used_at` update; throttle it or skip it in the MVP).
-- [ ] Endpoint CRUD with URL validation (https outside dev mode), secret generation, and the reveal-secret route.
-- [ ] `internal/ingest`: a single transaction that inserts the event and fans out deliveries (D1, D5).
-- [ ] Idempotency: `ON CONFLICT DO NOTHING`, replay response, and `409` on payload mismatch (§6.4).
-- [ ] Payload limits (256 KB, must be a JSON object) and `event_type` validation (`^[a-zA-Z0-9._-]{1,100}$`).
-- [ ] Integration tests against real Postgres:
+- [x] Chi router, JSON error helpers, and auth middleware (hash lookup, `last_used_at` update throttled to once a minute).
+- [x] Endpoint CRUD with URL validation (https in production) and SSRF checks (`internal/ssrf`), secret generation bound to the endpoint ID, and the reveal-secret route.
+- [x] `internal/ingest`: a single transaction that inserts the event and fans out deliveries (D1, D5).
+- [x] Idempotency: `ON CONFLICT DO NOTHING`, replay response, and `409` on payload mismatch (§6.4).
+- [x] Payload limits (256 KB, must be a JSON object) and `event_type` validation (`^[a-zA-Z0-9._-]{1,100}$`).
+- [x] API reference in `docs/API.md`.
+- [x] Integration tests against real Postgres (run on a Neon test branch):
   - fan-out matches event-type filters, including the empty-filter-means-all case
   - concurrent identical `Idempotency-Key` requests produce exactly one event
   - disabled and deleted endpoints receive no deliveries
 
 **Done when:** events can be posted with curl and the expected `pending` delivery rows appear.
+
+> Status: complete. 87 tests passed against a Neon `integration-tests` branch; `TestReadyzIntegration` skipped because no Redis is available. A curl smoke test of the real binary passed.
 
 ## Phase 3 — Delivery core (~4–5 days)
 

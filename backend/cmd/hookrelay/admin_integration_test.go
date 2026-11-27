@@ -21,6 +21,7 @@ func runCLI(t *testing.T, dbURL string, args ...string) (code int, stdout, stder
 	t.Helper()
 	setTestEnv(t)
 	t.Setenv("DATABASE_URL", dbURL)
+	t.Setenv("DATABASE_URL_UNPOOLED", dbURL)
 	var out, errOut bytes.Buffer
 	code = run(args, &out, &errOut)
 	return code, out.String(), errOut.String()

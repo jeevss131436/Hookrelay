@@ -82,6 +82,16 @@ func TestLoadErrors(t *testing.T) {
 		{"bad env", func(e map[string]string) { e["HOOKRELAY_ENV"] = "staging" }, "must be one of"},
 		{"missing database", func(e map[string]string) { delete(e, "DATABASE_URL") }, "DATABASE_URL: required"},
 		{"missing redis", func(e map[string]string) { delete(e, "REDIS_URL") }, "REDIS_URL: required"},
+		{"bad allow private", func(e map[string]string) { e["HOOKRELAY_ALLOW_PRIVATE_TARGETS"] = "yes" }, "must be true or false"},
+		{
+			"allow private in production",
+			func(e map[string]string) {
+				e["HOOKRELAY_ENV"] = "production"
+				e["DATABASE_URL"] = "postgres://u:p@db.example.com/x?sslmode=require"
+				e["HOOKRELAY_ALLOW_PRIVATE_TARGETS"] = "true"
+			},
+			"must not be true in production",
+		},
 		{"missing encryption key", func(e map[string]string) { delete(e, "HOOKRELAY_ENCRYPTION_KEY") }, "HOOKRELAY_ENCRYPTION_KEY: required"},
 		{"short encryption key", func(e map[string]string) { e["HOOKRELAY_ENCRYPTION_KEY"] = "c2hvcnQ=" }, "must decode to 32 bytes"},
 		{"non-base64 encryption key", func(e map[string]string) { e["HOOKRELAY_ENCRYPTION_KEY"] = "change-me!" }, "not valid base64"},

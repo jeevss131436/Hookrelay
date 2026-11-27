@@ -39,7 +39,7 @@ func do(t *testing.T, h http.Handler, method, path string, header http.Header) *
 }
 
 func TestHealthz(t *testing.T) {
-	h := NewRouter(discardLogger(), []Check{failCheck("postgres")})
+	h := NewRouter(discardLogger(), []Check{failCheck("postgres")}, nil)
 	rec := do(t, h, http.MethodGet, "/healthz", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (liveness must not depend on dependencies)", rec.Code)
@@ -74,7 +74,7 @@ func TestReadyz(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rec := do(t, NewRouter(discardLogger(), tt.checks), http.MethodGet, "/readyz", nil)
+			rec := do(t, NewRouter(discardLogger(), tt.checks, nil), http.MethodGet, "/readyz", nil)
 			if rec.Code != tt.wantCode {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantCode)
 			}
@@ -102,14 +102,14 @@ func TestReadyzHonorsCheckTimeout(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	}}
-	rec := do(t, NewRouter(discardLogger(), []Check{hang}), http.MethodGet, "/readyz", nil)
+	rec := do(t, NewRouter(discardLogger(), []Check{hang}, nil), http.MethodGet, "/readyz", nil)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 }
 
 func TestRequestID(t *testing.T) {
-	h := NewRouter(discardLogger(), nil)
+	h := NewRouter(discardLogger(), nil, nil)
 
 	t.Run("generated when absent", func(t *testing.T) {
 		rec := do(t, h, http.MethodGet, "/healthz", nil)
@@ -185,7 +185,7 @@ func TestRecovererReturns500(t *testing.T) {
 }
 
 func TestNotFoundUsesErrorEnvelope(t *testing.T) {
-	rec := do(t, NewRouter(discardLogger(), nil), http.MethodGet, "/nope", nil)
+	rec := do(t, NewRouter(discardLogger(), nil, nil), http.MethodGet, "/nope", nil)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -196,7 +196,7 @@ func TestNotFoundUsesErrorEnvelope(t *testing.T) {
 }
 
 func TestMethodNotAllowed(t *testing.T) {
-	rec := do(t, NewRouter(discardLogger(), nil), http.MethodPost, "/healthz", nil)
+	rec := do(t, NewRouter(discardLogger(), nil, nil), http.MethodPost, "/healthz", nil)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", rec.Code)
 	}
