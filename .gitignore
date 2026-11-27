@@ -1,0 +1,31 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Build output
+/bin/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Go workspace files (local only)
+go.work
+go.work.sum
+
+# Node / Next.js (web/, from Phase 6)
+node_modules/
+.next/
+out/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/settings.local.json
+.neon

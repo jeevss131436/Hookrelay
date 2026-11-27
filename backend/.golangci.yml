@@ -1,0 +1,33 @@
+version: "2"
+
+linters:
+  # "standard" = errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - bodyclose     # unclosed HTTP response bodies (matters for the delivery client)
+    - errorlint     # error comparisons/wrapping that break errors.Is/As
+    - gosec         # common security mistakes
+    - misspell
+    - noctx         # HTTP/DB calls without a context
+    - unconvert
+  settings:
+    govet:
+      enable:
+        - shadow
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/jeevss131436/Hookrelay

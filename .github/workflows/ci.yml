@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:18-alpine # matches Neon (PostgreSQL 18)
+        env:
+          POSTGRES_USER: hookrelay
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: hookrelay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hookrelay -d hookrelay_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Throwaway credentials for the ephemeral CI service containers only.
+      TEST_DATABASE_URL: postgres://hookrelay:ci-only-password@localhost:5432/hookrelay_test?sslmode=disable
+      TEST_REDIS_URL: redis://localhost:6379/0
+      GO_TEST_FLAGS: -race -count=1
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      # Installs golangci-lint and sqlc (sqlc builds with cgo; gcc is preinstalled on ubuntu runners).
+      - name: Install tools
+        run: make tools
+
+      - name: gofmt
+        run: make fmt-check
+
+      - name: go vet
+        run: make vet
+
+      - name: golangci-lint
+        run: make lint
+
+      - name: sqlc generated code is up to date
+        run: make sqlc-check
+
+      - name: go test
+        run: make test

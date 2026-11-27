@@ -1,0 +1,3 @@
+# Keep LF line endings in the repo so gofmt, shell recipes and Docker behave
+# the same on Windows and Linux.
+* text=auto eol=lf
