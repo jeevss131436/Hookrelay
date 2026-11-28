@@ -89,11 +89,22 @@ Read `ARCHITECTURE.md` first. The design decisions D1–D8 referenced below are 
 
 ## Phase 5 — Read APIs and operations (~2–3 days)
 
-- [ ] List and get for events, deliveries (with attempts) and endpoints, with cursor pagination and filters.
-- [ ] `POST /v1/deliveries/{id}/retry` and `POST /v1/endpoints/{id}/test`.
-- [ ] `GET /v1/stats` (counts by status, success rate, p50/p95, hourly buckets).
-- [ ] `/healthz` and `/readyz`.
-- [ ] Cancel pending and scheduled deliveries when an endpoint is deleted.
+- [x] List and get for events, deliveries and attempts (`GET /v1/deliveries/{id}/attempts`), with cursor pagination and filters (status, endpoint, event, event type, date range). Endpoints were listed in Phase 2.
+- [x] `POST /v1/deliveries/{id}/retry`: only `dead` deliveries with an active endpoint; one conditional update; exactly one more attempt; history preserved; picked up by the dispatcher.
+- [ ] `POST /v1/endpoints/{id}/test`. *Deferred: not needed by the backend MVP; the dashboard can send a test event through `POST /v1/events`.*
+- [x] `GET /v1/stats`: counts by status, success/failure rates, attempt counts, p50/p95/avg latency (successful and failed attempts separately), `from`/`to` window. *Hourly buckets deferred to Phase 6, when the dashboard chart needs them.*
+- [x] `/healthz` and `/readyz` (done in Phase 0).
+- [x] Cancel pending and scheduled deliveries when an endpoint is deleted (done in Phase 2).
+
+**Done when:** every read route, retry and stats are covered by integration tests, including tenant isolation and concurrency.
+
+> Status: complete. New: `internal/history`, `db/queries/reads.sql` and `stats.sql`, migration `00002_read_api_indexes`.
+> Integration tests (real Postgres on the Neon `integration-tests` branch, real Redis/Asynq for the pipeline tests): event and
+> delivery reads, attempts, pagination (including `created_at` ties), every filter, invalid parameters, cross-project
+> isolation, retry eligibility for every status, 20 concurrent retries (exactly one applies), a retried delivery going
+> through the real dispatcher and worker (fail → dead → retry → dead → retry → succeeded, 4 attempts kept), a hung
+> worker and a replayed old task fenced out after a manual retry, and stats (counts, rates, avg/p50/p95, half-open window,
+> empty project, isolation). Design notes: ARCHITECTURE §5.
 
 ## Phase 6 — Dashboard (~5–7 days)
 

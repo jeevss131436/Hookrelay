@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/jeevss131436/Hookrelay/backend/internal/endpoints"
+	"github.com/jeevss131436/Hookrelay/backend/internal/history"
 	"github.com/jeevss131436/Hookrelay/backend/internal/ingest"
 	"github.com/jeevss131436/Hookrelay/backend/internal/store"
 	"github.com/jeevss131436/Hookrelay/backend/internal/validation"
@@ -19,12 +20,14 @@ type API struct {
 	store     *store.Store
 	endpoints *endpoints.Service
 	ingest    *ingest.Service
+	history   *history.Service
 }
 
 // NewAPI builds the /v1 API. It has no Redis dependency: ingestion writes only
-// to PostgreSQL (transactional outbox).
-func NewAPI(log *slog.Logger, st *store.Store, eps *endpoints.Service, ing *ingest.Service) *API {
-	return &API{log: log, store: st, endpoints: eps, ingest: ing}
+// to PostgreSQL (transactional outbox), and a manual retry only makes the
+// delivery due again for the dispatcher.
+func NewAPI(log *slog.Logger, st *store.Store, eps *endpoints.Service, ing *ingest.Service, hist *history.Service) *API {
+	return &API{log: log, store: st, endpoints: eps, ingest: ing, history: hist}
 }
 
 // Request body limits.
@@ -49,6 +52,17 @@ func (a *API) Routes() http.Handler {
 		r.Use(a.authenticate)
 
 		r.Post("/events", a.handleCreateEvent)
+		r.Get("/events", a.handleListEvents)
+		r.Get("/events/{id}", a.handleGetEvent)
+
+		r.Route("/deliveries", func(r chi.Router) {
+			r.Get("/", a.handleListDeliveries)
+			r.Get("/{id}", a.handleGetDelivery)
+			r.Get("/{id}/attempts", a.handleListAttempts)
+			r.Post("/{id}/retry", a.handleRetryDelivery)
+		})
+
+		r.Get("/stats", a.handleStats)
 
 		r.Route("/endpoints", func(r chi.Router) {
 			r.Post("/", a.handleCreateEndpoint)
@@ -68,6 +82,7 @@ func (a *API) writeServiceError(w http.ResponseWriter, r *http.Request, op strin
 	var (
 		ve *validation.Error
 		ae *apiError
+		nr *history.NotRetryableError
 	)
 	switch {
 	case errors.As(err, &ae):
@@ -81,6 +96,18 @@ func (a *API) writeServiceError(w http.ResponseWriter, r *http.Request, op strin
 	case errors.Is(err, endpoints.ErrLimitReached):
 		writeError(w, http.StatusConflict, "endpoint_limit_reached",
 			"this project already has the maximum number of endpoints")
+	case errors.Is(err, history.ErrEventNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "event not found")
+	case errors.Is(err, history.ErrDeliveryNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "delivery not found")
+	case errors.As(err, &nr):
+		code := "delivery_not_retryable"
+		if nr.Reason == history.ReasonEndpointInactive {
+			code = "endpoint_inactive"
+		}
+		writeError(w, http.StatusConflict, code, nr.Error())
+	case errors.Is(err, history.ErrRetryRace):
+		writeError(w, http.StatusConflict, "conflict", err.Error())
 	case errors.Is(err, ingest.ErrIdempotencyConflict):
 		writeError(w, http.StatusConflict, "idempotency_key_reuse",
 			"this Idempotency-Key was already used with a different event_type or payload")

@@ -1,14 +1,21 @@
 # HookRelay REST API (v1)
 
-This reference matches the implementation in `backend/internal/httpapi`. Implemented so far: **event
-ingestion** and **endpoint management** (Phase 2). Webhook delivery, retries, and the read APIs for
-events and deliveries arrive in Phases 3–5 (see `IMPLEMENTATION_PLAN.md`).
+This reference matches the implementation in `backend/internal/httpapi`. Implemented: **event
+ingestion** and **endpoint management** (Phase 2), and the **read APIs** for events, deliveries and
+attempts, **manual retry**, and **statistics** (Phase 5). Delivery itself (Phases 3–4) happens in the
+worker; this API only reads its results.
 
 - Base URL: `http://localhost:8080` (local), path prefix `/v1`
 - JSON in and out. Requests with a body must send `Content-Type: application/json`.
 - Timestamps are RFC 3339 in UTC, e.g. `2026-11-27T05:41:57.763864Z`.
 - IDs are UUIDs.
 - Every response has an `X-Request-Id` header. Send your own (1–64 chars of `A-Za-z0-9._-`) to trace a request across systems.
+- **Lists** return `{"data": [...], "next_cursor": "…" | null}`. Pass `next_cursor` back as `?cursor=` for the next page;
+  it is `null` on the last page. Cursors are opaque and stable: rows created after the first page do not shift later
+  pages. Listings are newest first, ordered by `(created_at, id)` so items with equal timestamps never repeat or vanish
+  between pages. Page size is `limit` (1–100, default 50).
+- **Query parameters are strict.** An unknown parameter (e.g. a typo like `statsu=dead`), a repeated one, or a malformed
+  query string is `400 invalid_parameter`, so a broken filter never silently returns unfiltered data.
 
 ## Authentication
 
@@ -43,13 +50,16 @@ All errors use one envelope. `details` appears only on validation errors and map
 | Status | `code` | When |
 |---|---|---|
 | 400 | `invalid_json` | Body is empty, not valid JSON, not a single JSON object, or has an unknown field |
-| 400 | `invalid_parameter` | Bad `limit` or `cursor` query parameter |
+| 400 | `invalid_parameter` | Malformed query string; unknown or repeated query parameter; bad `limit`, `cursor`, filter or time value |
 | 400 | `invalid_header` | More than one `Idempotency-Key` header |
 | 401 | `unauthorized` | Missing, malformed, unknown or revoked API key |
-| 404 | `not_found` | Unknown route, or endpoint not found in your project |
+| 404 | `not_found` | Unknown route, or the endpoint, event or delivery does not exist in your project |
 | 405 | `method_not_allowed` | Wrong HTTP method for the route |
 | 409 | `idempotency_key_reuse` | `Idempotency-Key` already used with a different `event_type` or payload |
 | 409 | `endpoint_limit_reached` | Project already has 100 endpoints |
+| 409 | `delivery_not_retryable` | Manual retry of a delivery that is not `dead` |
+| 409 | `endpoint_inactive` | Manual retry of a dead delivery whose endpoint is disabled or deleted |
+| 409 | `conflict` | The delivery changed state while a retry was evaluated; send the request again |
 | 413 | `payload_too_large` | Event payload over 256 KB, or request body over the route limit |
 | 415 | `unsupported_media_type` | `Content-Type` is not `application/json` |
 | 422 | `validation_failed` | Field values are invalid; see `details` |
@@ -136,9 +146,62 @@ POST /v1/events
 ```
 
 Ingestion writes **only to PostgreSQL** and never touches Redis. It keeps working while Redis is down
-(`/readyz` then reports `redis: unavailable`, but `POST /v1/events` still returns `202`). In Phase 4 a
-dispatcher will move pending deliveries from PostgreSQL to the Redis queue (transactional outbox,
+(`/readyz` then reports `redis: unavailable`, but `POST /v1/events` still returns `202`). The
+dispatcher moves pending deliveries from PostgreSQL to the Redis queue (transactional outbox,
 `ARCHITECTURE.md` D1).
+
+### `GET /v1/events`: list events
+
+Newest first (`created_at DESC, id DESC`), cursor-paginated. Payloads are not listed (only their size); fetch one event to see it.
+
+| Query | Rules |
+|---|---|
+| `limit` | 1–100, default 50 |
+| `cursor` | The `next_cursor` from the previous page |
+| `event_type` | Exact event type (same format as on ingest) |
+| `created_after` | RFC 3339 timestamp, **inclusive** |
+| `created_before` | RFC 3339 timestamp, **exclusive**; must be later than `created_after` |
+
+```bash
+curl -s "http://localhost:8080/v1/events?event_type=order.paid&limit=2" -H "Authorization: Bearer $HOOKRELAY_API_KEY"
+```
+
+**`200 OK`**
+
+```json
+{
+  "data": [
+    {"id": "912c8f2f-d90c-41b7-87df-7e80f463c95a", "event_type": "order.paid",
+     "idempotency_key": "order-1001", "payload_size": 37, "created_at": "2026-11-27T05:41:57.763864Z"}
+  ],
+  "next_cursor": "MjAyNi0xMS0yN1Qw…"
+}
+```
+
+### `GET /v1/events/{id}`: retrieve an event
+
+**`200 OK`** with the payload and the status of each of its deliveries:
+
+```json
+{
+  "id": "912c8f2f-d90c-41b7-87df-7e80f463c95a",
+  "event_type": "order.paid",
+  "idempotency_key": "order-1001",
+  "created_at": "2026-11-27T05:41:57.763864Z",
+  "deliveries": [
+    {"id": "5f1ef97d-8709-4b68-b219-f34ae35de20a", "endpoint_id": "03b5e05c-f9f7-4ecf-a61c-65130ab8dfe9",
+     "endpoint_url": "https://example.com/webhooks", "status": "succeeded", "attempt_count": 1,
+     "last_status_code": 200, "created_at": "2026-11-27T05:41:57.763864Z",
+     "updated_at": "2026-11-27T05:41:58.104511Z", "completed_at": "2026-11-27T05:41:58.104511Z"}
+  ],
+  "deliveries_truncated": false,
+  "payload": {"order_id":1001,"amount":4999}
+}
+```
+
+- `payload` is the **exact stored bytes**, byte for byte as ingested (whitespace, key order and characters such as `<` and `&` are not re-encoded). These are the bytes that were signed and sent.
+- `deliveries` lists at most 100 deliveries, oldest first. If there are more, `deliveries_truncated` is `true`; list them all with `GET /v1/deliveries?event_id={id}`.
+- Unknown IDs, malformed IDs and other projects' events return `404 not_found`.
 
 ---
 
@@ -256,6 +319,200 @@ A second delete returns `404`.
 ```
 
 Returns `500 internal_error` if the stored ciphertext fails authentication (wrong encryption key, tampering, or a ciphertext moved from another endpoint).
+
+---
+
+## Deliveries
+
+A delivery is one event going to one endpoint. Delivery object:
+
+```json
+{
+  "id": "5f1ef97d-8709-4b68-b219-f34ae35de20a",
+  "event_id": "912c8f2f-d90c-41b7-87df-7e80f463c95a",
+  "event_type": "order.paid",
+  "endpoint_id": "03b5e05c-f9f7-4ecf-a61c-65130ab8dfe9",
+  "status": "scheduled",
+  "attempt_count": 2,
+  "max_attempts": 10,
+  "next_attempt_at": "2026-11-27T05:52:13.004211Z",
+  "last_status_code": 503,
+  "last_error": "HTTP 503",
+  "created_at": "2026-11-27T05:41:57.763864Z",
+  "updated_at": "2026-11-27T05:44:01.912402Z",
+  "completed_at": null
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `status` | `pending` (waiting for the dispatcher), `queued` (handed to the queue), `in_flight` (a worker is sending it), `scheduled` (waiting for a retry), `succeeded`, `dead` (gave up), `cancelled` (endpoint disabled or deleted) |
+| `attempt_count` | Attempts made so far |
+| `max_attempts` | Attempts allowed before the delivery goes `dead` (10 by default; each manual retry raises it by one) |
+| `next_attempt_at` | When the next attempt becomes due. Only set while `pending` or `scheduled`, otherwise `null` |
+| `last_status_code`, `last_error` | Outcome of the most recent attempt (`null` if none, or no HTTP response) |
+| `completed_at` | Set when the delivery reached `succeeded`, `dead` or `cancelled` |
+
+### `GET /v1/deliveries`: list deliveries
+
+Newest first (`created_at DESC, id DESC`), cursor-paginated. All filters combine with AND.
+
+| Query | Rules |
+|---|---|
+| `limit` | 1–100, default 50 |
+| `cursor` | The `next_cursor` from the previous page |
+| `status` | One status, or a comma-separated list (`status=dead,scheduled`) |
+| `endpoint_id` | UUID of an endpoint (deleted endpoints included) |
+| `event_id` | UUID of an event |
+| `event_type` | Exact event type of the delivery's event |
+| `created_after` | RFC 3339, **inclusive** |
+| `created_before` | RFC 3339, **exclusive** |
+
+```bash
+curl -s "http://localhost:8080/v1/deliveries?status=dead&limit=20" -H "Authorization: Bearer $HOOKRELAY_API_KEY"
+```
+
+**`200 OK`**: `{"data": [ { …delivery… } ], "next_cursor": "…"}`. IDs of other projects' endpoints or events simply match nothing.
+
+### `GET /v1/deliveries/{id}`: retrieve a delivery
+
+**`200 OK`** with the delivery object plus:
+
+```json
+{
+  "…": "all delivery fields",
+  "endpoint": {"id": "03b5e05c-…", "url": "https://example.com/webhooks", "enabled": true, "deleted": false},
+  "retryable": false
+}
+```
+
+`retryable` is `true` when `POST /v1/deliveries/{id}/retry` would currently be accepted. The endpoint is shown even if it
+was deleted later (`"deleted": true`). Its signing secret is never included.
+
+### `GET /v1/deliveries/{id}/attempts`: attempt history
+
+Oldest first (by `attempt_number`), cursor-paginated (`limit` 1–100, default 50; `cursor`). `404` if the delivery does not exist in your project.
+
+```json
+{
+  "data": [
+    {"attempt_number": 1, "started_at": "2026-11-27T05:41:58.004Z", "finished_at": "2026-11-27T05:41:58.130Z",
+     "duration_ms": 126, "succeeded": false, "response_status": 503, "response_body": "upstream unavailable",
+     "error_kind": "http_status", "error_message": "HTTP 503"},
+    {"attempt_number": 2, "started_at": "2026-11-27T05:44:01.800Z", "finished_at": "2026-11-27T05:44:11.800Z",
+     "duration_ms": 10000, "succeeded": false, "response_status": null, "response_body": null,
+     "error_kind": "timeout", "error_message": "Client.Timeout exceeded while awaiting headers"}
+  ],
+  "next_cursor": null
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `succeeded` | The receiver answered 2xx |
+| `duration_ms` | From sending the request to the response, timeout or error |
+| `response_status`, `response_body` | The receiver's HTTP status and the first 4 KB of its body; `null` if no response arrived |
+| `error_kind` | `null` on success, else `http_status`, `timeout`, `connection`, `dns`, `tls`, `ssrf_blocked`, or `worker_lost` (the worker died mid-attempt and the reaper recovered the delivery) |
+| `error_message` | Human-readable detail (at most 1 KB; never contains the endpoint URL) |
+
+Attempt numbers are never reused or reset, including across manual retries.
+
+### `POST /v1/deliveries/{id}/retry`: manual retry
+
+Gives a **dead** delivery exactly one more attempt. No request body.
+
+```bash
+curl -s -X POST http://localhost:8080/v1/deliveries/$DELIVERY_ID/retry -H "Authorization: Bearer $HOOKRELAY_API_KEY"
+```
+
+**`202 Accepted`** with the delivery detail in its new state:
+
+```json
+{"id": "5f1ef97d-…", "status": "pending", "attempt_count": 10, "max_attempts": 11,
+ "next_attempt_at": "2026-11-27T06:10:00.100Z", "completed_at": null, "retryable": false, "…": "…"}
+```
+
+**Eligibility.** Only `dead` deliveries whose endpoint is still enabled and not deleted can be retried.
+
+| Current state | Response |
+|---|---|
+| `dead`, endpoint enabled | `202`; the delivery becomes `pending` and is due immediately |
+| `pending`, `queued`, `in_flight`, `scheduled` | `409 delivery_not_retryable` (it is still being worked on) |
+| `succeeded` | `409 delivery_not_retryable` (it was delivered; HookRelay does not resend successes) |
+| `cancelled` | `409 delivery_not_retryable` (it was cancelled because its endpoint was disabled or deleted) |
+| `dead`, endpoint disabled or deleted | `409 endpoint_inactive`; re-enable the endpoint first |
+| Unknown ID, malformed ID, other project | `404 not_found` |
+
+**What a retry does**, in one conditional `UPDATE … WHERE status = 'dead'`:
+- `status = 'pending'`, `next_attempt_at = now()`, `completed_at = null`.
+- `max_attempts = attempt_count + 1`: exactly **one** more attempt. If it fails, the delivery goes straight back to `dead`
+  with no automatic retries. Retry again to try once more.
+- `attempt_count` is **not** reset and no attempt rows are touched, so the history is preserved and the next attempt gets the
+  next attempt number.
+- Nothing is sent to Redis by the API. The dispatcher picks the delivery up within its polling interval, and it goes through
+  the normal worker pipeline (signed with the endpoint's current secret, same `webhook-id`).
+
+**Concurrency.** Of several simultaneous retries of the same delivery, exactly one gets `202`; the others get `409`
+because the delivery is no longer `dead`. A rare `409 conflict` means the delivery changed state while the request was
+being evaluated; send it again.
+
+---
+
+## Statistics
+
+### `GET /v1/stats`: project statistics
+
+Aggregates over a time window `[from, to)` (from inclusive, to exclusive).
+
+| Query | Rules |
+|---|---|
+| `from` | RFC 3339. Default: 24 hours before `to` |
+| `to` | RFC 3339. Default: now |
+
+`from` must be earlier than `to`, and the window may be at most 90 days.
+
+```bash
+curl -s "http://localhost:8080/v1/stats?from=2026-11-26T00:00:00Z&to=2026-11-27T00:00:00Z" \
+  -H "Authorization: Bearer $HOOKRELAY_API_KEY"
+```
+
+**`200 OK`**
+
+```json
+{
+  "from": "2026-11-26T00:00:00Z",
+  "to": "2026-11-27T00:00:00Z",
+  "events": {"total": 1200},
+  "deliveries": {
+    "total": 2400, "pending": 0, "queued": 2, "in_flight": 3, "scheduled": 15,
+    "succeeded": 2350, "dead": 25, "cancelled": 5,
+    "success_rate": 0.9894736842105263, "failure_rate": 0.010526315789473684
+  },
+  "attempts": {"total": 2510, "succeeded": 2350, "failed": 160, "success_rate": 0.9362549800796812},
+  "latency_ms": {
+    "successful_attempts": {"count": 2350, "avg": 84.2, "p50": 61, "p95": 240.5},
+    "failed_attempts": {"count": 158, "avg": 3120.7, "p50": 450, "p95": 10000}
+  }
+}
+```
+
+**Definitions**
+
+| Metric | Definition |
+|---|---|
+| `events.total` | Events whose `created_at` is in the window |
+| `deliveries.*` | Deliveries whose `created_at` is in the window, counted by their **current** status. `total` is the sum of the seven statuses. A delivery created in the window but still retrying shows as `scheduled`, even if its later attempts fall outside the window. |
+| `deliveries.success_rate` | `succeeded / (succeeded + dead)`: the outcome of deliveries that have **finished**. In-progress and `cancelled` deliveries are excluded. `null` when no delivery in the window has finished. |
+| `deliveries.failure_rate` | `dead / (succeeded + dead)`. `success_rate + failure_rate = 1` when both are non-null. |
+| `attempts.*` | Attempts whose `finished_at` is in the window. `succeeded` = the receiver answered 2xx; `failed` = everything else, including `worker_lost`. `success_rate = succeeded / total`, `null` when there are no attempts. |
+| `latency_ms.successful_attempts` | `duration_ms` of successful attempts in the window: `count`, `avg`, `p50`, `p95`. This is the receiver's response time as seen by HookRelay. |
+| `latency_ms.failed_attempts` | The same for failed attempts, **excluding `worker_lost`** (their duration is how long the lease ran, not an HTTP round trip). Timeouts are included, so this is typically dominated by the 10 s timeout. |
+
+- Successful and failed latencies are never mixed: a fast `500` and a slow success are reported in different groups.
+- Percentiles use PostgreSQL `percentile_cont`, which interpolates between neighbouring values (the p50 of 10 and 20 is 15).
+- `avg`, `p50` and `p95` are `null` when their `count` is 0. Rates are fractions between 0 and 1, not percentages.
+- All three groups are computed in one read-only `REPEATABLE READ` transaction, so they describe one consistent snapshot.
+- End-to-end latency (ingest to successful delivery) and time-series buckets are not reported yet.
 
 ---
 

@@ -5,7 +5,7 @@ PostgreSQL, a Go worker delivers them to registered endpoints with signed HTTP r
 exponential-backoff retries and a full attempt history, and a Next.js dashboard shows
 what happened.
 
-**Status:** Phases 0–4 are complete: scaffolding; schema and data access; the API (API-key auth, endpoint CRUD, event ingestion); the delivery core (Asynq worker, Standard Webhooks signing, SSRF-guarded sender, claim/record fencing, retry scheduling in Postgres); and the dispatcher and reaper with end-to-end reliability tests. Integration tests pass on a Neon test branch with local Redis. Next is Phase 5 (read APIs, manual retry, stats). Follow `docs/IMPLEMENTATION_PLAN.md` phase by phase.
+**Status:** Phases 0–5 are complete: scaffolding; schema and data access; the API (API-key auth, endpoint CRUD, event ingestion); the delivery core (Asynq worker, Standard Webhooks signing, SSRF-guarded sender, claim/record fencing, retry scheduling in Postgres); the dispatcher and reaper with end-to-end reliability tests; and the read APIs (events, deliveries, attempts), manual retry of dead deliveries, and `GET /v1/stats`. Integration tests pass on a Neon test branch with local Redis. Next is Phase 6 (dashboard). Follow `docs/IMPLEMENTATION_PLAN.md` phase by phase.
 
 ## Docs (read before making design changes)
 - `docs/PRODUCT_SPEC.md`: what we're building and what is out of scope for the MVP.
@@ -54,6 +54,7 @@ backend/internal/endpoints/                    # endpoint service: validation, S
 backend/internal/ingest/                       # event ingest: one tx = event + fan-out deliveries (outbox); no Redis
 backend/internal/delivery/                     # Asynq task (MaxRetry 0) + handler: claim tx -> sign/send -> record tx; SSRF-guarded Sender; EnqueueOne
 backend/internal/dispatch/                     # Dispatcher (Postgres -> Redis, commit then enqueue, release on failure) + Reaper (stale queued, expired in_flight)
+backend/internal/history/                      # read side: events/deliveries/attempts listings, manual retry (dead -> pending, one attempt), stats (SQL aggregates)
 backend/internal/signing/                      # Standard Webhooks HMAC-SHA256 sign/verify
 backend/internal/backoff/                      # exponential backoff, full jitter, Retry-After (base 5m, cap 6h)
 backend/internal/mockreceiver/                 # receiver handler used by cmd/mockreceiver and tests
@@ -107,7 +108,7 @@ startup error, and all problems are reported together. When adding a variable, a
 - Go: pass `context.Context` everywhere. Wrap errors with `fmt.Errorf("...: %w", err)`. Log with `slog` and include `delivery_id`/`event_id`/`request_id` fields. Do not use global state beyond `main`.
 - SQL is hand-written in `db/queries`, then sqlc generates the code. Never edit generated files.
 - Schema changes go in a new goose migration with a working `-- +goose Down`. Never edit an applied migration. Run `make sqlc` afterwards; `docs/ARCHITECTURE.md §4` summarizes the schema and must be kept in sync.
-- Tenant-owned tables carry `project_id`, and child rows use composite FKs `(project_id, id)`. Every query on tenant data takes `project_id`. The exceptions are `GetActiveAPIKeyByHash` (how the project is determined) and the dispatcher/reaper maintenance queries in `db/queries/deliveries.sql`, which move rows between internal states system-wide and never return tenant data.
+- Tenant-owned tables carry `project_id`, and child rows use composite FKs `(project_id, id)`. Every query on tenant data takes `project_id`. Listings are keyset-paginated with a `LIMIT` (no unbounded reads); read-API query parameters are strict (unknown/malformed = 400). The exceptions are `GetActiveAPIKeyByHash` (how the project is determined) and the dispatcher/reaper maintenance queries in `db/queries/deliveries.sql`, which move rows between internal states system-wide and never return tenant data.
 - Multi-statement writes go through `store.InTx`. Never make network calls other than to Postgres inside it.
 - Secrets: never log plaintext API keys, signing secrets or the encryption key. `secrets.Key` and `secrets.APIKey` redact themselves in fmt/slog; keep it that way for any new secret type. Use `store.IsUniqueViolation`/`IsForeignKeyViolation`/`IsNotFound` instead of matching error strings.
 - HTTP errors use the envelope `{"error":{"code","message"}}` (see `writeError` in `internal/httpapi`).

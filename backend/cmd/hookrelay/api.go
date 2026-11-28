@@ -13,6 +13,7 @@ import (
 
 	"github.com/jeevss131436/Hookrelay/backend/internal/config"
 	"github.com/jeevss131436/Hookrelay/backend/internal/endpoints"
+	"github.com/jeevss131436/Hookrelay/backend/internal/history"
 	"github.com/jeevss131436/Hookrelay/backend/internal/httpapi"
 	"github.com/jeevss131436/Hookrelay/backend/internal/ingest"
 	"github.com/jeevss131436/Hookrelay/backend/internal/secrets"
@@ -54,6 +55,7 @@ func runAPI(ctx context.Context, e *cmdEnv) error {
 			AllowPrivate: cfg.AllowPrivateTargets,
 		}),
 		ingest.NewService(st),
+		history.NewService(st),
 	)
 	if cfg.AllowPrivateTargets {
 		log.Warn("HOOKRELAY_ALLOW_PRIVATE_TARGETS=true: SSRF address checks are disabled (development only)")

@@ -330,6 +330,7 @@ migration wins and this section should be fixed.
 - `deliveries_due_idx (next_attempt_at) WHERE status IN ('pending','scheduled')` is the dispatcher hot path.
 - `deliveries_stuck_idx (status, updated_at) WHERE status IN ('queued','in_flight')` serves the reaper.
 - `(project_id, created_at DESC, id DESC)` on `events` and `deliveries`, and `(endpoint_id, created_at DESC, id DESC)` on `deliveries`, support cursor-paginated listings.
+- Added in `00002_read_api_indexes` (Phase 5): `deliveries (project_id, status, created_at DESC, id DESC)` for `GET /v1/deliveries?status=…` (without it a rare status such as `dead` is found by walking the project's whole listing index), and `events (project_id, event_type, created_at DESC, id DESC)` for `GET /v1/events?event_type=…`. Filtering deliveries by `event_type` joins `events` and is not separately indexed.
 - Lookups by `event_id` on `deliveries` use the `UNIQUE (event_id, endpoint_id)` index, so there is no separate index.
 - `delivery_attempts (project_id, finished_at)` serves per-project stats windows.
 - `api_keys (project_id, created_at DESC)` serves key listings.
@@ -348,7 +349,7 @@ migration wins and this section should be fixed.
 - `UNIQUE (event_id, endpoint_id)` makes fan-out safe to retry.
 - `UNIQUE (delivery_id, attempt_number)` makes recording an attempt idempotent. A fenced-out worker's insert either succeeds as a historical record or conflicts harmlessly.
 - Response headers are not stored in the MVP, to limit storage. They can be added as `jsonb` later.
-- Stats for p50/p95 come from `percentile_cont` over `delivery_attempts` in a time window. This is fine at MVP scale. Rollup tables come later if needed.
+- Stats for p50/p95 come from `percentile_cont` over `delivery_attempts` in a time window. This is fine at MVP scale (a sort of the window's attempt durations per request). Rollup tables come later if needed; Phase 7 measures it with `EXPLAIN ANALYZE`.
 
 ### 4.1 Secret storage
 
@@ -377,6 +378,32 @@ API key once, to stdout, and logs only its prefix.
 > - Disabling or deleting an endpoint cancels its `pending`/`scheduled` deliveries in the same transaction.
 > - The endpoint limit (100) is enforced under a `SELECT … FOR UPDATE` lock on the project row.
 > - `last_used_at` is updated at most once per minute per key.
+>
+> Phase 5 implementation decisions (read APIs, manual retry, stats; `internal/history`):
+> - **Manual retry is allowed only from `dead`** (this table originally also allowed `cancelled` and `succeeded`). A
+>   `succeeded` delivery was delivered, and re-sending it on request is a different feature (redelivery) with different
+>   semantics for receivers. A `cancelled` delivery was cancelled because its endpoint was disabled or deleted, and
+>   PRODUCT_SPEC §4.2 says re-enabling does not resurrect it. A dead delivery whose endpoint is now disabled or deleted is
+>   refused too (`409 endpoint_inactive`), because the worker would only cancel it. PRODUCT_SPEC §4.4 asks for retry of
+>   "dead or failed" deliveries; there is no separate failed state, a failed attempt with attempts left is `scheduled`
+>   and is retried automatically.
+> - **A retry grants exactly one attempt and never rewrites history:** `status='pending'`, `next_attempt_at=now()`,
+>   `max_attempts = attempt_count + 1`, `completed_at`, `queued_at`, `locked_until` cleared, in one
+>   `UPDATE … WHERE status='dead'` (joined to an active endpoint). `attempt_count` is not reset, so attempt numbers stay
+>   unique, history rows stay, and every `attempt_count` fence keeps rejecting older workers. The dispatcher's next
+>   `→ queued` sets a fresh `queued_at`, so tasks from earlier dispatches cannot claim (§3.6). Of N concurrent retries
+>   exactly one matches. The API does not enqueue to Redis (D1).
+> - **Attempts have their own paginated route** (`GET /v1/deliveries/{id}/attempts`) instead of being embedded in the
+>   delivery, which keeps every response bounded.
+> - **Stats take `from`/`to`** (default: the last 24 h; at most 90 days) instead of `window=24h`. Deliveries are counted by
+>   `created_at` with their current status; attempts by `finished_at`. Success and failure latency are reported
+>   separately, and `worker_lost` attempts are excluded from latency. All aggregation is SQL (`percentile_cont`), run in
+>   one read-only `REPEATABLE READ` transaction. Definitions are in API.md.
+> - **Strict query parameters:** unknown, repeated or malformed parameters are `400`, so a typo never silently returns
+>   unfiltered data. Optional filters are `NULL`-able sqlc parameters (`$x IS NULL OR col = $x`).
+> - **Event payloads are returned byte-exact** (spliced into the JSON response, not re-encoded), matching D5.
+> - Deferred from the original Phase 5 list: `POST /v1/endpoints/{id}/test`, hourly time-series buckets in stats, and
+>   24 h health counts on `GET /v1/endpoints/{id}`.
 
 **Conventions**
 - Base path `/v1`. JSON in and out. Auth uses `Authorization: Bearer hr_<random>`. Every query is scoped to the key's project.
@@ -388,8 +415,8 @@ API key once, to stdout, and logs only its prefix.
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/events` | Ingest. Body `{event_type, payload}`. Optional header `Idempotency-Key`. Returns `202 {id, event_type, created_at, deliveries_created}`. |
-| `GET` | `/v1/events` | List. Filters: `event_type`, `created_after`, `created_before`. |
-| `GET` | `/v1/events/{id}` | Event with payload and a summary of its deliveries (status per endpoint). |
+| `GET` | `/v1/events` | List. Filters: `event_type`, `created_after`, `created_before`. *(Phase 5)* |
+| `GET` | `/v1/events/{id}` | Event with its exact payload and a summary of its deliveries (status per endpoint, up to 100). *(Phase 5)* |
 
 ### Endpoints
 | Method | Path | Description |
@@ -405,14 +432,15 @@ API key once, to stdout, and logs only its prefix.
 ### Deliveries
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/v1/deliveries` | List. Filters: `status`, `endpoint_id`, `event_id`. |
-| `GET` | `/v1/deliveries/{id}` | Delivery plus all its attempts. |
-| `POST` | `/v1/deliveries/{id}/retry` | Only from `dead`, `cancelled` or `succeeded` (redelivery). Resets to `pending` with `next_attempt_at=now()` and sets `max_attempts = attempt_count + 1`, which allows exactly one manual attempt. If that attempt fails, the delivery goes back to `dead` with no automatic retries. Returns `202`. |
+| `GET` | `/v1/deliveries` | List. Filters: `status` (one or a list), `endpoint_id`, `event_id`, `event_type`, `created_after`, `created_before`. *(Phase 5)* |
+| `GET` | `/v1/deliveries/{id}` | Delivery with its endpoint and event type, and whether it is retryable. *(Phase 5)* |
+| `GET` | `/v1/deliveries/{id}/attempts` | Attempt history, paginated by attempt number. *(Phase 5)* |
+| `POST` | `/v1/deliveries/{id}/retry` | Only from `dead`, with an enabled endpoint (see the Phase 5 decisions above). Resets to `pending` with `next_attempt_at=now()` and sets `max_attempts = attempt_count + 1`, which allows exactly one manual attempt. If that attempt fails, the delivery goes back to `dead` with no automatic retries. Returns `202`. *(Phase 5)* |
 
 ### Stats and ops
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/v1/stats?window=24h` | Counts by status, success rate, p50/p95 latency, volume time series (hourly buckets). |
+| `GET` | `/v1/stats?from=&to=` | Counts by status, success/failure rates, attempt counts, p50/p95 latency of successful and failed attempts. *(Phase 5; hourly buckets deferred)* |
 | `GET` | `/healthz` | Liveness, with no dependency checks. |
 | `GET` | `/readyz` | Pings Postgres and Redis. |
 
@@ -497,7 +525,7 @@ hookrelay/
 ├── docs/
 ├── backend/
 │   ├── cmd/
-│   │   ├── hookrelay/          # main: subcommands api | worker | migrate | admin
+│   │   ├── hookrelay/          # main: subcommands api | worker | dispatcher | reaper | migrate | admin
 │   │   └── mockreceiver/       # test receiver with configurable latency/failure rate
 │   ├── internal/
 │   │   ├── config/             # env parsing + invariant validation
@@ -505,6 +533,7 @@ hookrelay/
 │   │   ├── store/              # sqlc-generated code + tx helpers
 │   │   ├── ingest/             # event ingest + fan-out service
 │   │   ├── dispatch/           # dispatcher + reaper loops
+│   │   ├── history/            # read APIs, manual retry, stats (Phase 5)
 │   │   ├── delivery/           # asynq handler, sender, ssrf dialer, attempt recording
 │   │   ├── signing/            # Standard Webhooks HMAC sign/verify
 │   │   ├── backoff/            # retry schedule
