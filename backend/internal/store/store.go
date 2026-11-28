@@ -68,3 +68,12 @@ func (s *Store) InTx(ctx context.Context, fn func(q *sqlcgen.Queries) error) err
 		return fn(s.WithTx(tx))
 	})
 }
+
+// InSnapshot runs fn in a READ ONLY, REPEATABLE READ transaction, so several
+// read queries see one consistent snapshot (used by GET /v1/stats).
+func (s *Store) InSnapshot(ctx context.Context, fn func(q *sqlcgen.Queries) error) error {
+	opts := pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}
+	return pgx.BeginTxFunc(ctx, s.pool, opts, func(tx pgx.Tx) error {
+		return fn(s.WithTx(tx))
+	})
+}

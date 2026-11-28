@@ -21,6 +21,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/jeevss131436/Hookrelay/backend/internal/endpoints"
+	"github.com/jeevss131436/Hookrelay/backend/internal/history"
 	"github.com/jeevss131436/Hookrelay/backend/internal/ingest"
 	"github.com/jeevss131436/Hookrelay/backend/internal/secrets"
 	"github.com/jeevss131436/Hookrelay/backend/internal/ssrf"
@@ -88,7 +89,7 @@ func newAPIEnv(t *testing.T) *apiEnv {
 	log := slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	api := NewAPI(log, st,
 		endpoints.NewService(st, cipher, ssrf.Policy{RequireHTTPS: true, Resolver: testResolver}),
-		ingest.NewService(st))
+		ingest.NewService(st), history.NewService(st))
 
 	deadRedis := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 200 * time.Millisecond, MaxRetries: -1})
 	t.Cleanup(func() { _ = deadRedis.Close() })

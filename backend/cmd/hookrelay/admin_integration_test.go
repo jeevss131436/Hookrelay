@@ -137,7 +137,8 @@ func TestMigrateCLI(t *testing.T) {
 	db := pgtest.NewEmpty(t)
 
 	code, stdout, stderr := runCLI(t, db.URL, "migrate", "up")
-	if code != 0 || !strings.Contains(stdout, "Applied  00001_initial_schema.sql") || !strings.Contains(stdout, "Schema version: 1") {
+	if code != 0 || !strings.Contains(stdout, "Applied  00001_initial_schema.sql") ||
+		!strings.Contains(stdout, "Applied  00002_read_api_indexes.sql") || !strings.Contains(stdout, "Schema version: 2") {
 		t.Fatalf("up: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
 	if _, stdout, _ = runCLI(t, db.URL, "migrate", "up"); !strings.Contains(stdout, "No pending migrations.") {
@@ -146,8 +147,12 @@ func TestMigrateCLI(t *testing.T) {
 	if _, stdout, _ = runCLI(t, db.URL, "migrate", "status"); !strings.Contains(stdout, "applied") || !strings.Contains(stdout, "00001_initial_schema.sql") {
 		t.Errorf("status: %s", stdout)
 	}
+	// Each down undoes one migration; every migration must be reversible.
+	if code, stdout, _ = runCLI(t, db.URL, "migrate", "down"); code != 0 || !strings.Contains(stdout, "Schema version: 1") {
+		t.Errorf("first down: exit %d: %s", code, stdout)
+	}
 	if code, stdout, _ = runCLI(t, db.URL, "migrate", "down"); code != 0 || !strings.Contains(stdout, "Schema version: 0") {
-		t.Errorf("down: exit %d: %s", code, stdout)
+		t.Errorf("second down: exit %d: %s", code, stdout)
 	}
 	if _, stdout, _ = runCLI(t, db.URL, "migrate", "version"); !strings.Contains(stdout, "Schema version: 0") {
 		t.Errorf("version: %s", stdout)
